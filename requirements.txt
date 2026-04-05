@@ -1,0 +1,14 @@
+streamlit>=1.35.0
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.26.0
+matplotlib>=3.8.0
+scikit-learn>=1.4.0
+groq>=0.9.0
+newspaper3k>=0.2.8
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+lxml>=5.0.0
+lxml-html-clean>=0.1.0
+Pillow>=10.0.0
+python-dotenv>=1.0.0
