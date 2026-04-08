@@ -99,15 +99,12 @@ h1, h2, h3 { font-family: 'Space Mono', monospace; }
 }
 .tag { display: inline-block; background: #1e3a5f; color: #7dd3fc; border-radius: 6px; padding: 0.15rem 0.6rem; font-size: 0.78rem; font-family: 'Space Mono', monospace; margin: 2px; }
 [data-testid="stChatMessage"] {
-    background: #0d1b2a;
-    border: 1px solid #1e3a5f;
-    border-radius: 12px;
-    margin-bottom: 0.75rem;
+    background: #0d1b2a; border: 1px solid #1e3a5f;
+    border-radius: 12px; margin-bottom: 0.75rem;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Auto-refresh for live news tab ────────────────────────────────────────────
 try:
     from streamlit_autorefresh import st_autorefresh
     AUTOREFRESH_AVAILABLE = True
@@ -129,14 +126,15 @@ with st.sidebar:
     st.markdown("### 📡 Live Feed Settings")
     refresh_interval = st.slider("Refresh interval (seconds)", 15, 120, 30, 5)
     st.markdown("---")
-    st.markdown("### 🧠 Recommended Workflow")
+    st.markdown("### 🧠 Workflow")
     st.markdown("""
     <div style="color:#6b8fad;font-size:0.82rem;line-height:1.8;">
-    1️⃣ Enter tickers → Run Correlation<br>
-    2️⃣ Paste news URLs → Run Sentiment<br>
-    3️⃣ Check Portfolio Risk<br>
-    4️⃣ Chat with AI Advisor<br>
-    5️⃣ Start Live News Feed
+    1️⃣ Correlation Analytics<br>
+    2️⃣ News Sentiment<br>
+    3️⃣ Portfolio Risk<br>
+    4️⃣ AI Advisor<br>
+    5️⃣ Live Intelligence<br>
+    6️⃣ Ticker Signals
     </div>
     """, unsafe_allow_html=True)
     st.markdown("---")
@@ -146,29 +144,28 @@ with st.sidebar:
 st.markdown("""
 <div style="padding: 2rem 0 1rem;">
   <div class="hero-title">📈 FinSight AI</div>
-  <div class="hero-sub">Financial Analytics · Sentiment · Portfolio Risk · AI Advisor · Live News Intelligence</div>
+  <div class="hero-sub">Correlations · Sentiment · Risk · AI Advisor · Live News · Ticker Signals</div>
 </div>
 """, unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊  Correlation Analytics",
     "📰  News Sentiment",
     "⚠️  Portfolio Risk",
     "🧠  AI Advisor",
     "📡  Live Intelligence",
+    "🎯  Ticker Signals",
 ])
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TAB 1 — CORRELATION ANALYTICS
+# TAB 1
 # ═══════════════════════════════════════════════════════════════════════════
 with tab1:
     st.markdown('<div class="section-header">📊 Market Correlation Engine</div>', unsafe_allow_html=True)
     col_in, col_hint = st.columns([3, 2])
     with col_in:
-        tickers_input = st.text_input(
-            "Enter Tickers (comma-separated)",
-            placeholder="e.g. TSLA, NVDA, AMD, BTC-USD, ^GSPC",
-        )
+        tickers_input = st.text_input("Enter Tickers (comma-separated)",
+            placeholder="e.g. TSLA, NVDA, AMD, BTC-USD, ^GSPC")
     with col_hint:
         st.markdown('<div class="insight-card" style="margin-top:1.6rem;padding:0.8rem 1.2rem;"><span class="tag">STOCKS</span><span class="tag">ETFs</span><span class="tag">CRYPTO</span><span class="tag">INDICES</span></div>', unsafe_allow_html=True)
     if st.button("🚀 Run Correlation Analysis", key="run_corr"):
@@ -181,10 +178,11 @@ with tab1:
             else:
                 from modules.correlation_engine import run_correlation_analysis
                 run_correlation_analysis(tickers=tickers, start_date=str(start_date),
-                    rolling_window=rolling_window, n_estimators=n_estimators, train_split=train_split/100)
+                    rolling_window=rolling_window, n_estimators=n_estimators,
+                    train_split=train_split/100)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TAB 2 — NEWS SENTIMENT
+# TAB 2
 # ═══════════════════════════════════════════════════════════════════════════
 with tab2:
     st.markdown('<div class="section-header">📰 AI News Sentiment Engine</div>', unsafe_allow_html=True)
@@ -202,7 +200,7 @@ with tab2:
             run_sentiment_analysis(urls=urls, groq_api_key=GROQ_API_KEY)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TAB 3 — PORTFOLIO RISK
+# TAB 3
 # ═══════════════════════════════════════════════════════════════════════════
 with tab3:
     st.markdown('<div class="section-header">⚠️ Portfolio Risk Insights</div>', unsafe_allow_html=True)
@@ -211,7 +209,7 @@ with tab3:
     run_portfolio_risk()
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TAB 4 — AI ADVISOR
+# TAB 4
 # ═══════════════════════════════════════════════════════════════════════════
 with tab4:
     st.markdown('<div class="section-header">🧠 AI Financial Advisor</div>', unsafe_allow_html=True)
@@ -223,27 +221,38 @@ with tab4:
         run_advisor(groq_api_key=GROQ_API_KEY)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TAB 5 — LIVE INTELLIGENCE
+# TAB 5
 # ═══════════════════════════════════════════════════════════════════════════
 with tab5:
     st.markdown('<div class="section-header">📡 Live Market Intelligence</div>', unsafe_allow_html=True)
-    st.markdown(f"""
-    <div class="insight-card">
-        <b style="color:#7dd3fc;">Real-time news → AI stock signals</b><br>
-        <span style="color:#6b8fad;font-size:0.9rem;">
-        Scans {len(__import__('modules.live_news_engine', fromlist=['RSS_FEEDS']).RSS_FEEDS)} live financial news sources every {refresh_interval} seconds.
-        New articles are instantly analysed by AI which returns BUY / SHORT / HOLD signals
-        with reasoning, confidence, and time horizon. No manual input needed — just press Start.
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
-
+    st.markdown(f'<div class="insight-card"><b style="color:#7dd3fc;">Real-time news → AI stock signals</b><br><span style="color:#6b8fad;font-size:0.9rem;">Scans 10 live financial news sources every {refresh_interval} seconds. New articles are instantly analysed — returns BUY / SHORT / HOLD / WATCH signals with confidence and time horizon.</span></div>', unsafe_allow_html=True)
     if not GROQ_API_KEY:
         st.error("❌ Groq API key not configured.")
     else:
-        # Auto-refresh only fires when live feed is running
         if AUTOREFRESH_AVAILABLE and st.session_state.get("live_running", False):
             st_autorefresh(interval=refresh_interval * 1000, key="live_refresh")
-
         from modules.live_news_engine import run_live_news
         run_live_news(api_key=GROQ_API_KEY, refresh_interval=refresh_interval)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 6 — TICKER SIGNALS
+# ═══════════════════════════════════════════════════════════════════════════
+with tab6:
+    st.markdown('<div class="section-header">🎯 Ticker Signal Analyser</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="insight-card">
+        <b style="color:#7dd3fc;">How it works:</b><br>
+        <span style="color:#6b8fad;font-size:0.9rem;">
+        Enter any ticker(s) → the AI scans all live news sources for relevant articles →
+        returns a full signal for each ticker including BUY / SHORT / HOLD / WATCH,
+        confidence level, time horizon, bull case, bear case, and key risk.
+        If no direct news is found, signals are based on macro context with LOW confidence — 
+        so every ticker always gets a real, honest answer.
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
+    if not GROQ_API_KEY:
+        st.error("❌ Groq API key not configured.")
+    else:
+        from modules.ticker_analysis_engine import run_ticker_analysis
+        run_ticker_analysis(api_key=GROQ_API_KEY)
