@@ -485,7 +485,9 @@ def run_portfolio_tracker():
         ticker = row["Ticker"]
         d      = data.get(ticker, {})
 
-        with st.expander(f"**{ticker}** — {row['Sector']}  ·  P&L: {'+' if (row['P&L (%)'] or 0) >= 0 else ''}{row['P&L (%)']:.1f}%  ·  Tech: {row['Tech Signal']}" if row['P&L (%)'] is not None else f"**{ticker}** — {row['Sector']}", expanded=False):
+        _pnl_pct = row['P&L (%)'] if pd.notna(row['P&L (%)']) else None
+        _label = f"**{ticker}** — {row['Sector']}  ·  P&L: {'+' if (_pnl_pct or 0) >= 0 else ''}{_pnl_pct:.1f}%  ·  Tech: {row['Tech Signal']}" if _pnl_pct is not None else f"**{ticker}** — {row['Sector']}"
+        with st.expander(_label, expanded=False):
 
             col_a, col_b, col_c = st.columns(3)
 
@@ -506,7 +508,7 @@ def run_portfolio_tracker():
 
             with col_b:
                 st.markdown("**📊 Technicals**")
-                rsi = row.get("RSI")
+                rsi = row["RSI"] if pd.notna(row["RSI"]) else None
                 ma50 = row.get("MA50")
                 ma200 = row.get("MA200")
                 high52 = row.get("52W High")
@@ -524,11 +526,11 @@ def run_portfolio_tracker():
 - **RSI (14):** {rsi_str}{rsi_label}
 - **50-Day MA:** ${ma50:.2f}{ma_signal if ma50 else ""} {" ✅ above" if row['Price'] and ma50 and row['Price'] > ma50 else " ❌ below" if row['Price'] and ma50 else ""}
 - **200-Day MA:** ${ma200:.2f} {" ✅ above" if row['Price'] and ma200 and row['Price'] > ma200 else " ❌ below" if row['Price'] and ma200 else ""}
-- **52W High:** ${high52:.2f} ({row['From 52W High']:+.1f}%)
-- **52W Low:** ${low52:.2f} ({row['From 52W Low']:+.1f}%)
+- **52W High:** {"$"+f"{high52:.2f}" if high52 else "N/A"} ({f"{row.get('From 52W High', None):+.1f}%" if row.get('From 52W High') is not None else "N/A"})
+- **52W Low:** {"$"+f"{low52:.2f}" if low52 else "N/A"} ({f"{row.get('From 52W Low', None):+.1f}%" if row.get('From 52W Low') is not None else "N/A"})
 - **Volatility:** {f"{vol:.1f}%" if vol else "N/A"} annualised
 - **Beta:** {beta if beta else "N/A"}
-                """ if ma50 and ma200 and high52 else "Data loading…")
+                """ if ma50 and ma200 else "Data loading…")
 
                 # Technical signal badge
                 sig_color = {"BUY": GREEN, "SHORT": RED, "NEUTRAL": AMBER}.get(row["Tech Signal"], MUTED)
@@ -632,11 +634,11 @@ def run_portfolio_tracker():
             flags.append(("ok", f"🟢 **{r['Ticker 1']}/{r['Ticker 2']}** correlation = {r['Correlation']:.2f} — natural hedge."))
 
     for _, row in df.iterrows():
-        if row.get("Today (%)") and abs(row["Today (%)"]) > 3:
+        if row["Today (%)"] if pd.notna(row["Today (%)"]) else None and abs(row["Today (%)"]) > 3:
             flags.append(("warn", f"⚡ **{row['Ticker']}** moved {row['Today (%)']:+.1f}% today (${row['Today ($)']:+,.0f} impact)."))
-        if row.get("P&L (%)") and row["P&L (%)"] < -20:
+        if row["P&L (%)"] if pd.notna(row["P&L (%)"]) else None and row["P&L (%)"] < -20:
             flags.append(("risk", f"🔴 **{row['Ticker']}** is down {row['P&L (%)']:.1f}% from avg cost — review your thesis."))
-        rsi = row.get("RSI")
+        rsi = row["RSI"] if pd.notna(row["RSI"]) else None
         if rsi and rsi > 75:
             flags.append(("warn", f"🟡 **{row['Ticker']}** RSI = {rsi:.0f} — overbought. Consider trimming or hedging."))
         if rsi and rsi < 25:
