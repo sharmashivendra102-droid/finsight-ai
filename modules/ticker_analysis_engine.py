@@ -440,6 +440,14 @@ def run_ticker_analysis(api_key: str):
     st.session_state["ticker_analysis_articles"] = relevant
     st.session_state["ticker_analysis_time"]     = datetime.now().strftime("%H:%M:%S")
 
+    # Log all signals to history
+    try:
+        from modules.signal_history import log_signals_from_ticker
+        for r in results:
+            log_signals_from_ticker(r)
+    except Exception:
+        pass
+
     _display_results(results, relevant)
 
 

@@ -452,14 +452,14 @@ def _display_results(results: dict, strategy_name: str, target: str):
 
     # Honest warnings
     if sh < 0:
-        st.error("🔴 Negative Sharpe — strategy lost money on a risk-adjusted basis. This strategy has no edge for this ticker/period.")
+        st.error("🔴 Negative Sharpe — strategy lost money on a risk-adjusted basis. No edge found for this ticker/period.")
     elif sh < 0.5:
         st.warning("🟡 Sharpe below 0.5 — modest or marginal edge. Not strong enough to trade with real conviction.")
     else:
-        st.success(f"🟢 Sharpe of {sh:.2f} — meaningful edge detected over buy-and-hold.")
+        st.success(f"🟢 Sharpe of {sh:.2f} — good risk-adjusted returns. Note: high Sharpe means smoother, safer returns — NOT necessarily higher total return than buy-and-hold.")
 
     if ret_s < ret_bh:
-        st.warning(f"🟡 Buy-and-hold outperformed by {(ret_bh - ret_s)*100:.1f}%. Simply holding {target} beat this strategy.")
+        st.info(f"ℹ️ Buy-and-hold had higher total return (+{ret_bh*100:.1f}% vs {ret_s*100:.1f}%). This is normal — trend strategies trade less often and avoid drawdowns, so they sacrifice some upside for lower risk. Compare the Max Drawdown and Sharpe, not just total return.")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1: _metric_box("Strategy Return",  f"{ret_s*100:.1f}%",

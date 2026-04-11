@@ -1,16 +1,18 @@
 """
 Live News Intelligence Engine
 - Polls RSS feeds from major financial news sources
+- User-controlled article age filter
 - Sends new articles to Groq for market interpretation
 - Returns structured BUY / SHORT / HOLD signals
 """
 
 import streamlit as st
 import feedparser
-import json
 import re
+import json
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -23,24 +25,48 @@ RSS_FEEDS = {
     "MarketWatch":       "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
     "Investing.com":     "https://www.investing.com/rss/news.rss",
     "WSJ Markets":       "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
-    "FT":                "https://www.ft.com/rss/home/uk",
     "Seeking Alpha":     "https://seekingalpha.com/feed.xml",
+    "FT":                "https://www.ft.com/rss/home/uk",
 }
 
 MAX_ARTICLES_PER_REFRESH = 5
-MAX_FEED_ARTICLES        = 3
+MAX_FEED_ARTICLES        = 5
 
 
 def _article_id(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()
 
 
-def _fetch_latest_articles() -> list:
+def _parse_pub_date(entry) -> datetime | None:
+    """Try multiple date fields, return UTC-aware datetime or None."""
+    for field in ("published", "updated", "created"):
+        raw = entry.get(field, "")
+        if not raw:
+            continue
+        try:
+            dt = parsedate_to_datetime(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_latest_articles(max_age_hours: int) -> list:
+    """Fetch articles from RSS feeds, filtering by age."""
     articles = []
+    now      = datetime.now(timezone.utc)
+    cutoff   = now - timedelta(hours=max_age_hours)
+
     for source, feed_url in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:MAX_FEED_ARTICLES]:
+            count = 0
+            for entry in feed.entries:
+                if count >= MAX_FEED_ARTICLES:
+                    break
+
                 url     = entry.get("link", "")
                 title   = entry.get("title", "").strip()
                 summary = entry.get("summary", entry.get("description", "")).strip()
@@ -48,16 +74,45 @@ def _fetch_latest_articles() -> list:
                 summary = re.sub(r"\s+", " ", summary).strip()
                 if not url or not title:
                     continue
+
+                # Age filter
+                pub_dt = _parse_pub_date(entry)
+                if pub_dt is not None:
+                    if pub_dt < cutoff:
+                        continue   # article is too old
+                    age_str = _format_age(now, pub_dt)
+                else:
+                    age_str = "unknown age"
+
                 articles.append({
-                    "id":      _article_id(url),
-                    "source":  source,
-                    "title":   title,
-                    "summary": summary[:800],
-                    "url":     url,
+                    "id":       _article_id(url),
+                    "source":   source,
+                    "title":    title,
+                    "summary":  summary[:800],
+                    "url":      url,
+                    "pub_dt":   pub_dt,
+                    "age_str":  age_str,
                 })
+                count += 1
+
         except Exception:
             continue
+
+    # Sort newest first
+    articles.sort(key=lambda x: x["pub_dt"] or datetime.min.replace(tzinfo=timezone.utc),
+                  reverse=True)
     return articles
+
+
+def _format_age(now: datetime, pub_dt: datetime) -> str:
+    diff = now - pub_dt
+    mins = int(diff.total_seconds() / 60)
+    if mins < 60:
+        return f"{mins}m ago"
+    hours = mins // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
 
 
 def _analyze_with_groq(articles: list, api_key: str) -> list:
@@ -68,7 +123,7 @@ def _analyze_with_groq(articles: list, api_key: str) -> list:
 
     article_text = ""
     for i, art in enumerate(articles, 1):
-        article_text += f"\n[{i}] SOURCE: {art['source']}\nTITLE: {art['title']}\nSUMMARY: {art['summary']}\n"
+        article_text += f"\n[{i}] SOURCE: {art['source']}\nTITLE: {art['title']}\nSUMMARY: {art['summary']}\nURL: {art['url']}\n"
 
     prompt = f"""You are a professional Wall Street trader. Analyze these {len(articles)} news articles and return a JSON array.
 
@@ -120,78 +175,52 @@ Articles:
 
 
 def _render_signal_card(article: dict, analysis: dict):
-    """Render a signal card using native Streamlit components — no raw HTML."""
-
     impact  = analysis.get("market_impact", "NEUTRAL")
     urgency = analysis.get("urgency", "LOW")
     recs    = analysis.get("recommendations", [])
 
-    # ── Impact colour mapping ──────────────────────────────────────────────
     impact_icon  = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(impact, "⚪")
     urgency_icon = {"HIGH": "🔥", "MEDIUM": "⚡", "LOW": "💤"}.get(urgency, "")
     action_emoji = {"BUY": "📈", "SHORT": "📉", "HOLD": "➡️", "WATCH": "👁️"}
+    action_dot   = {"BUY": "🟢", "SHORT": "🔴", "HOLD": "🟡", "WATCH": "🔵"}
 
-    # ── Card container ─────────────────────────────────────────────────────
     with st.container():
         st.markdown("---")
-
-        # Header row
-        h_col1, h_col2 = st.columns([5, 1])
-        with h_col1:
-            st.caption(f"**{article['source']}** · Detected {datetime.now().strftime('%H:%M:%S')}")
+        h1, h2 = st.columns([5, 1])
+        with h1:
+            age = article.get("age_str", "")
+            st.caption(f"**{article['source']}** · {age} · Detected {datetime.now().strftime('%H:%M:%S')}")
             st.markdown(f"**{article['title']}**")
-        with h_col2:
+        with h2:
             st.markdown(f"**{impact_icon} {impact}**")
             st.caption(f"{urgency_icon} {urgency}")
 
-        # Reasoning
         st.markdown(f"> {analysis.get('impact_reasoning', '')}")
 
-        # Recommendations
         if recs:
             rec_cols = st.columns(min(len(recs), 3))
             for i, rec in enumerate(recs):
-                action     = rec.get("action", "WATCH")
-                ticker     = rec.get("ticker", "—")
-                reasoning  = rec.get("reasoning", "")
-                confidence = rec.get("confidence", "")
-                horizon    = rec.get("time_horizon", "")
-                emoji      = action_emoji.get(action, "👁️")
-
-                action_colors = {
-                    "BUY":   "🟢",
-                    "SHORT": "🔴",
-                    "HOLD":  "🟡",
-                    "WATCH": "🔵",
-                }
-                dot = action_colors.get(action, "⚪")
-
+                action    = rec.get("action", "WATCH")
+                ticker    = rec.get("ticker", "—")
+                reasoning = rec.get("reasoning", "")
+                conf      = rec.get("confidence", "")
+                horizon   = rec.get("time_horizon", "")
+                dot       = action_dot.get(action, "⚪")
+                emoji     = action_emoji.get(action, "👁️")
                 with rec_cols[i % 3]:
-                    st.markdown(f"""
-**{dot} {ticker}** — `{action}` {emoji}
+                    st.markdown(f"**{dot} {ticker}** — `{action}` {emoji}\n\n{reasoning}\n\n*{conf} · {horizon}*")
 
-{reasoning}
-
-*Confidence: {confidence} · {horizon}*
-""")
-
-        # Sectors + risk + link
         sectors  = ", ".join(analysis.get("affected_sectors", []))
         key_risk = analysis.get("key_risk", "")
-        meta_parts = []
-        if sectors:
-            meta_parts.append(f"📂 {sectors}")
-        if key_risk:
-            meta_parts.append(f"⚠️ Risk: {key_risk}")
-        if meta_parts:
-            st.caption("  ·  ".join(meta_parts))
-
+        parts = []
+        if sectors:  parts.append(f"📂 {sectors}")
+        if key_risk: parts.append(f"⚠️ {key_risk}")
+        if parts:    st.caption("  ·  ".join(parts))
         st.markdown(f"[🔗 Read full article →]({article['url']})")
 
 
-def run_live_news(api_key: str, refresh_interval: int):
+def run_live_news(api_key: str, refresh_interval: int, max_age_hours: int):
 
-    # ── Init session state ─────────────────────────────────────────────────
     if "seen_article_ids"  not in st.session_state:
         st.session_state["seen_article_ids"]  = set()
     if "processed_signals" not in st.session_state:
@@ -203,7 +232,7 @@ def run_live_news(api_key: str, refresh_interval: int):
     if "total_processed"   not in st.session_state:
         st.session_state["total_processed"]   = 0
 
-    # ── Control bar ────────────────────────────────────────────────────────
+    # ── Controls ───────────────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
     with c1:
         if st.button("▶️ Start", key="live_start", use_container_width=True):
@@ -222,9 +251,9 @@ def run_live_news(api_key: str, refresh_interval: int):
         is_running = st.session_state["live_running"]
         last_fetch = st.session_state["last_fetch_time"]
         total      = st.session_state["total_processed"]
-        status     = "🟢 LIVE — scanning news sources" if is_running else "⚪ PAUSED"
+        status     = "🟢 LIVE" if is_running else "⚪ PAUSED"
         last_str   = f"Last scan: {last_fetch}" if last_fetch else "Not scanned yet"
-        st.info(f"{status}  ·  {last_str}  ·  {total} articles processed")
+        st.info(f"{status}  ·  {last_str}  ·  {total} processed  ·  Max article age: **{max_age_hours}h**")
 
     # ── Filters ────────────────────────────────────────────────────────────
     with st.expander("🔧 Filters"):
@@ -239,7 +268,10 @@ def run_live_news(api_key: str, refresh_interval: int):
     # ── Fetch & process ────────────────────────────────────────────────────
     if st.session_state["live_running"]:
         with st.spinner("📡 Scanning news sources…"):
-            all_articles = _fetch_latest_articles()
+            all_articles = _fetch_latest_articles(max_age_hours)
+
+        if not all_articles:
+            st.warning(f"⚠️ No articles found within the last {max_age_hours} hour(s). Try increasing the Max Article Age in the sidebar.")
 
         new_articles = [
             a for a in all_articles
@@ -248,7 +280,7 @@ def run_live_news(api_key: str, refresh_interval: int):
 
         if new_articles:
             batch = new_articles[:MAX_ARTICLES_PER_REFRESH]
-            with st.spinner(f"🧠 AI analysing {len(batch)} new article(s)…"):
+            with st.spinner(f"🧠 Analysing {len(batch)} new article(s)…"):
                 analyses = _analyze_with_groq(batch, api_key)
 
             for analysis in analyses:
@@ -259,19 +291,37 @@ def run_live_news(api_key: str, refresh_interval: int):
                     st.session_state["processed_signals"].insert(0, (article, analysis))
                     st.session_state["total_processed"] += 1
 
+                    # Log to signal history
+                    try:
+                        from modules.signal_history import log_signals_from_live
+                        log_signals_from_live(article, analysis)
+                    except Exception:
+                        pass
+
+                    # Email alert for HIGH urgency
+                    if analysis.get("urgency") == "HIGH":
+                        try:
+                            from modules.email_alerts import send_alert, is_configured
+                            if is_configured():
+                                sent = send_alert(article, analysis)
+                                if sent:
+                                    st.toast("📧 Alert emailed for HIGH urgency signal!")
+                        except Exception:
+                            pass
+
             for a in new_articles[MAX_ARTICLES_PER_REFRESH:]:
                 st.session_state["seen_article_ids"].add(a["id"])
 
         st.session_state["last_fetch_time"] = datetime.now().strftime("%H:%M:%S")
 
-    # ── Render signals ─────────────────────────────────────────────────────
+    # ── Render ─────────────────────────────────────────────────────────────
     signals = st.session_state["processed_signals"]
 
     if not signals:
         if st.session_state["live_running"]:
-            st.info("⏳ Scanning… first results will appear shortly.")
+            st.info("⏳ Scanning… results will appear shortly.")
         else:
-            st.info("Press **▶️ Start** to begin scanning live news sources.")
+            st.info("Press **▶️ Start** to begin scanning live news.")
         return
 
     filtered = [
@@ -285,6 +335,5 @@ def run_live_news(api_key: str, refresh_interval: int):
         return
 
     st.caption(f"**{len(filtered)} signal(s)** — newest first")
-
     for article, analysis in filtered:
         _render_signal_card(article, analysis)

@@ -1,13 +1,5 @@
 """
-Market Open Summary Engine
-===========================
-Generates a structured pre-market briefing:
-  - Overnight news from RSS feeds
-  - Pre-market price moves via yfinance
-  - Key economic events (static calendar awareness)
-  - AI-generated sector-by-sector outlook
-  - Top 3 tickers to watch with reasoning
-  - Overall market bias for the day
+Market Summary Engine - Fixed NaN issue with yfinance fallback pricing
 """
 
 import streamlit as st
@@ -31,7 +23,6 @@ RSS_FEEDS = {
     "WSJ Markets":       "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
 }
 
-# Key market indicators to pull pre-market data for
 MARKET_INDICATORS = {
     "S&P 500":   "^GSPC",
     "Nasdaq":    "^IXIC",
@@ -44,37 +35,49 @@ MARKET_INDICATORS = {
 }
 
 SECTOR_ETFS = {
-    "Technology":          "XLK",
-    "Energy":              "XLE",
-    "Financials":          "XLF",
-    "Healthcare":          "XLV",
-    "Industrials":         "XLI",
-    "Consumer Disc.":      "XLY",
-    "Consumer Staples":    "XLP",
-    "Materials":           "XLB",
-    "Real Estate":         "XLRE",
-    "Utilities":           "XLU",
-    "Communication Svcs":  "XLC",
+    "Technology":         "XLK",
+    "Energy":             "XLE",
+    "Financials":         "XLF",
+    "Healthcare":         "XLV",
+    "Industrials":        "XLI",
+    "Consumer Disc.":     "XLY",
+    "Consumer Staples":   "XLP",
+    "Materials":          "XLB",
+    "Real Estate":        "XLRE",
+    "Utilities":          "XLU",
+    "Communication Svcs": "XLC",
 }
 
 
-@st.cache_data(ttl=300, show_spinner=False)   # cache 5 min — pre-market data doesn't change fast
+@st.cache_data(ttl=300, show_spinner=False)
 def _fetch_market_data() -> dict:
-    """Fetch latest price data for key indicators."""
+    """
+    Fetch price data. Uses a 5-day window and takes the two most recent
+    non-NaN closes so we always get a valid price even outside market hours.
+    """
     import yfinance as yf
     results = {}
-
     all_symbols = list(MARKET_INDICATORS.values()) + list(SECTOR_ETFS.values())
 
     for symbol in all_symbols:
         try:
-            t   = yf.Ticker(symbol)
-            hist = t.history(period="5d", interval="1d")
-            if hist.empty or len(hist) < 2:
+            hist = yf.Ticker(symbol).history(period="10d", interval="1d")
+            if hist.empty:
                 continue
-            close_today = float(hist["Close"].iloc[-1])
-            close_prev  = float(hist["Close"].iloc[-2])
-            pct_chg     = (close_today - close_prev) / close_prev * 100
+
+            # Drop rows where Close is NaN
+            closes = hist["Close"].dropna()
+            if len(closes) < 2:
+                continue
+
+            # Take two most recent valid closes
+            close_today = float(closes.iloc[-1])
+            close_prev  = float(closes.iloc[-2])
+
+            if close_today == 0 or close_prev == 0:
+                continue
+
+            pct_chg = (close_today - close_prev) / close_prev * 100
             results[symbol] = {
                 "price":   close_today,
                 "prev":    close_prev,
@@ -86,9 +89,8 @@ def _fetch_market_data() -> dict:
     return results
 
 
-@st.cache_data(ttl=180, show_spinner=False)   # cache 3 min
+@st.cache_data(ttl=180, show_spinner=False)
 def _fetch_overnight_news() -> list:
-    """Pull latest articles from RSS feeds."""
     articles = []
     seen = set()
     for source, url in RSS_FEEDS.items():
@@ -114,73 +116,74 @@ def _fetch_overnight_news() -> list:
     return articles[:25]
 
 
-def _generate_summary_with_groq(
-    articles: list,
-    market_data: dict,
-    api_key: str,
-    watchlist: list,
-) -> dict:
+def _generate_summary_with_groq(articles, market_data, api_key, watchlist):
     from groq import Groq
 
-    # Build market data context
     market_lines = []
     for name, symbol in MARKET_INDICATORS.items():
         if symbol in market_data:
-            d   = market_data[symbol]
-            chg = d["pct_chg"]
+            d     = market_data[symbol]
+            chg   = d["pct_chg"]
             arrow = "▲" if chg >= 0 else "▼"
             market_lines.append(f"  {name} ({symbol}): {arrow} {abs(chg):.2f}%  |  Last: {d['price']:.2f}")
+        else:
+            market_lines.append(f"  {name} ({symbol}): data unavailable")
 
     sector_lines = []
     for name, symbol in SECTOR_ETFS.items():
         if symbol in market_data:
-            d   = market_data[symbol]
-            chg = d["pct_chg"]
+            d     = market_data[symbol]
+            chg   = d["pct_chg"]
             arrow = "▲" if chg >= 0 else "▼"
             sector_lines.append(f"  {name} ({symbol}): {arrow} {abs(chg):.2f}%")
+        else:
+            sector_lines.append(f"  {name} ({symbol}): data unavailable")
 
     article_text = ""
     for i, art in enumerate(articles[:18], 1):
         article_text += f"[{i}] {art['source']}: {art['title']}\n{art['summary'][:300]}\n\n"
 
-    watchlist_str = ", ".join(watchlist) if watchlist else "none specified"
+    watchlist_str = ", ".join(watchlist) if watchlist else "none"
     today_str     = datetime.now().strftime("%A, %B %d, %Y")
     time_str      = datetime.now().strftime("%H:%M ET")
 
     prompt = f"""You are the head of market research at a major investment bank.
 Today is {today_str}. Time: {time_str}.
-Generate a structured pre-market briefing for traders and investors.
+Generate a structured pre-market briefing.
 
-MARKET DATA (latest):
-{chr(10).join(market_lines) if market_lines else "Data unavailable"}
+IMPORTANT: Use ONLY the price data provided below. Do NOT invent price levels.
+If a data point says "data unavailable", omit it from your levels_to_watch.
+
+MARKET DATA:
+{chr(10).join(market_lines)}
 
 SECTOR PERFORMANCE:
-{chr(10).join(sector_lines) if sector_lines else "Data unavailable"}
+{chr(10).join(sector_lines)}
 
 OVERNIGHT NEWS:
 {article_text}
 
 USER WATCHLIST: {watchlist_str}
 
-Return ONLY a valid JSON object with this exact structure:
+Return ONLY a valid JSON object:
 {{
   "market_bias": "<BULLISH|BEARISH|NEUTRAL|MIXED>",
   "bias_confidence": "<HIGH|MEDIUM|LOW>",
-  "one_line_summary": "<single punchy sentence capturing today's market mood>",
+  "one_line_summary": "<single punchy sentence>",
   "key_themes": [
     {{
-      "theme": "<theme name e.g. Geopolitical Risk, AI Earnings, Rate Expectations>",
-      "description": "<2 sentences explaining this theme and its market impact>",
+      "theme": "<name>",
+      "description": "<2 sentences>",
       "impact": "<POSITIVE|NEGATIVE|NEUTRAL>",
       "affected_sectors": ["<sector>"]
     }}
   ],
   "sector_outlook": [
     {{
-      "sector": "<sector name>",
+      "sector": "<name>",
       "bias": "<BULLISH|BEARISH|NEUTRAL>",
       "reasoning": "<one sentence>",
-      "etf": "<ETF symbol>"
+      "etf": "<symbol>"
     }}
   ],
   "tickers_to_watch": [
@@ -189,36 +192,36 @@ Return ONLY a valid JSON object with this exact structure:
       "company": "<name>",
       "action": "<BUY|SHORT|HOLD|WATCH>",
       "confidence": "<HIGH|MEDIUM|LOW>",
-      "reasoning": "<specific reason citing news or data>",
-      "catalyst": "<what specific event or news is the catalyst>",
-      "risk": "<key risk to this thesis>"
+      "reasoning": "<specific reason>",
+      "catalyst": "<specific catalyst>",
+      "risk": "<key risk>"
     }}
   ],
   "watchlist_signals": [
     {{
-      "ticker": "<symbol from user watchlist>",
+      "ticker": "<symbol>",
       "signal": "<BUY|SHORT|HOLD|WATCH>",
       "confidence": "<HIGH|MEDIUM|LOW>",
-      "notes": "<brief note — can be LOW confidence if no direct news>"
+      "notes": "<brief note>"
     }}
   ],
   "macro_risks": ["<risk 1>", "<risk 2>", "<risk 3>"],
   "levels_to_watch": [
     {{
-      "instrument": "<e.g. S&P 500, 10Y Yield, Oil>",
-      "level": "<price or yield level>",
-      "significance": "<why this level matters>"
+      "instrument": "<name>",
+      "level": "<level from the actual data provided>",
+      "significance": "<why it matters>"
     }}
   ],
-  "morning_playbook": "<3-4 sentence actionable summary of what a trader should be thinking about today>"
+  "morning_playbook": "<3-4 sentence actionable summary>"
 }}
 
 Rules:
-- tickers_to_watch: exactly 3-5 tickers, only where you have HIGH or MEDIUM confidence
-- sector_outlook: cover 4-6 sectors most affected by today's news
-- key_themes: 2-4 themes maximum
-- watchlist_signals: include ALL tickers from user watchlist, use LOW confidence if no direct news
-- Be specific — cite actual news headlines, actual price levels
+- tickers_to_watch: 3-5 tickers, HIGH or MEDIUM confidence only
+- sector_outlook: 4-6 sectors most affected by today's news
+- key_themes: 2-4 themes
+- watchlist_signals: ALL tickers from watchlist, LOW confidence if no direct news
+- levels_to_watch: ONLY use price levels from the market data above — never invent them
 - Return ONLY valid JSON, no markdown, no backticks"""
 
     client = Groq(api_key=api_key)
@@ -235,33 +238,45 @@ Rules:
         if match:
             raw = match.group(0)
         return json.loads(raw)
-    except json.JSONDecodeError:
-        st.error("❌ AI returned malformed response. Try regenerating.")
-        return {}
     except Exception as e:
         st.error(f"❌ Groq error: {str(e)[:150]}")
         return {}
 
 
-def _render_market_indicator(name, symbol, data):
+def _render_indicator(name, symbol, data):
     if symbol not in data:
+        st.markdown(f"""
+        <div style="background:#0d1b2a;border:1px solid #1e3a5f;border-radius:8px;
+                    padding:0.6rem 0.8rem;text-align:center;">
+            <div style="color:#6b8fad;font-size:0.7rem;font-family:'Space Mono',monospace;">{name}</div>
+            <div style="color:#6b8fad;font-size:0.75rem;">N/A</div>
+        </div>
+        """, unsafe_allow_html=True)
         return
     d     = data[symbol]
     chg   = d["pct_chg"]
     color = "#4ade80" if chg >= 0 else "#f87171"
     arrow = "▲" if chg >= 0 else "▼"
+    price = d["price"]
+    # Format price nicely
+    if price >= 1000:
+        price_str = f"{price:,.0f}"
+    elif price >= 10:
+        price_str = f"{price:.2f}"
+    else:
+        price_str = f"{price:.4f}"
+
     st.markdown(f"""
     <div style="background:#0d1b2a;border:1px solid #1e3a5f;border-radius:8px;
                 padding:0.6rem 0.8rem;text-align:center;">
         <div style="color:#6b8fad;font-size:0.7rem;font-family:'Space Mono',monospace;">{name}</div>
-        <div style="color:#c9d8e8;font-size:0.85rem;font-weight:600;">{d['price']:.2f}</div>
+        <div style="color:#c9d8e8;font-size:0.85rem;font-weight:600;">{price_str}</div>
         <div style="color:{color};font-size:0.8rem;font-weight:700;">{arrow} {abs(chg):.2f}%</div>
     </div>
     """, unsafe_allow_html=True)
 
 
 def run_market_summary(api_key: str):
-
     today_str = datetime.now().strftime("%A, %B %d, %Y")
     time_str  = datetime.now().strftime("%H:%M")
 
@@ -276,23 +291,20 @@ def run_market_summary(api_key: str):
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Watchlist input ────────────────────────────────────────────────────
     with st.expander("⚙️ Configure your watchlist (optional)", expanded=False):
         watchlist_input = st.text_input(
-            "Your tickers (comma-separated) — these get specific signals in the briefing",
+            "Your tickers (comma-separated)",
             placeholder="e.g. TSLA, NVDA, AAPL",
             key="summary_watchlist"
         )
         watchlist = [t.strip().upper() for t in watchlist_input.split(",") if t.strip()] if watchlist_input else []
 
-    col_gen, col_cache = st.columns([2, 3])
+    col_gen, col_info = st.columns([2, 3])
     with col_gen:
-        generate_btn = st.button("🔄 Generate / Refresh Briefing", key="gen_summary",
-                                 use_container_width=True)
-    with col_cache:
-        st.caption("Briefing is cached for 5 minutes. Click refresh to pull the latest news.")
+        generate_btn = st.button("🔄 Generate / Refresh Briefing", key="gen_summary", use_container_width=True)
+    with col_info:
+        st.caption("Briefing is cached for 5 minutes. Price data uses most recent available close — indices show previous close outside market hours.")
 
-    # Auto-show last briefing
     if not generate_btn and st.session_state.get("market_summary_data"):
         _display_summary(
             st.session_state["market_summary_data"],
@@ -305,13 +317,14 @@ def run_market_summary(api_key: str):
         st.info("👆 Click **Generate Briefing** to get your pre-market summary.")
         return
 
-    # ── Fetch data ─────────────────────────────────────────────────────────
     with st.spinner("📡 Fetching market data…"):
         market_data = _fetch_market_data()
 
+    available = [s for s in list(MARKET_INDICATORS.values()) + list(SECTOR_ETFS.values()) if s in market_data]
+    st.caption(f"Market data loaded for {len(available)}/{len(MARKET_INDICATORS)+len(SECTOR_ETFS)} symbols")
+
     with st.spinner("📰 Pulling overnight news…"):
         articles = _fetch_overnight_news()
-
     st.caption(f"Fetched {len(articles)} articles from {len(RSS_FEEDS)} sources")
 
     with st.spinner("🧠 AI generating briefing…"):
@@ -328,51 +341,44 @@ def run_market_summary(api_key: str):
     _display_summary(summary, market_data, articles)
 
 
-def _display_summary(summary: dict, market_data: dict, articles: list):
-
+def _display_summary(summary, market_data, articles):
     bias      = summary.get("market_bias", "NEUTRAL")
     bias_conf = summary.get("bias_confidence", "LOW")
     one_liner = summary.get("one_line_summary", "")
 
-    bias_color = {"BULLISH": "#4ade80", "BEARISH": "#f87171",
-                  "NEUTRAL": "#94a3b8", "MIXED": "#fbbf24"}.get(bias, "#94a3b8")
-    bias_icon  = {"BULLISH": "🟢", "BEARISH": "🔴",
-                  "NEUTRAL": "⚪", "MIXED": "🟡"}.get(bias, "⚪")
+    bias_color = {"BULLISH": "#4ade80", "BEARISH": "#f87171", "NEUTRAL": "#94a3b8", "MIXED": "#fbbf24"}.get(bias, "#94a3b8")
+    bias_icon  = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪", "MIXED": "🟡"}.get(bias, "⚪")
     conf_icon  = {"HIGH": "🔵", "MEDIUM": "🟡", "LOW": "🔘"}.get(bias_conf, "🔘")
 
-    # ── Market bias banner ─────────────────────────────────────────────────
     st.markdown(f"""
     <div style="background:linear-gradient(135deg,#0d1b2a,#0f2035);
                 border:2px solid {bias_color}33;border-radius:14px;
                 padding:1.2rem 1.6rem;margin-bottom:1rem;">
         <div style="display:flex;align-items:center;gap:1rem;">
-            <div style="font-family:'Space Mono',monospace;font-size:2rem;
-                        font-weight:700;color:{bias_color};">
+            <div style="font-family:'Space Mono',monospace;font-size:2rem;color:{bias_color};font-weight:700;">
                 {bias_icon} {bias}
             </div>
             <div>
                 <div style="color:#c9d8e8;font-size:1rem;font-weight:500;">{one_liner}</div>
-                <div style="color:#6b8fad;font-size:0.78rem;margin-top:0.2rem;">
-                    {conf_icon} {bias_conf} confidence
-                </div>
+                <div style="color:#6b8fad;font-size:0.78rem;margin-top:0.2rem;">{conf_icon} {bias_conf} confidence</div>
             </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Market indicators strip ────────────────────────────────────────────
+    # ── Market indicators ──────────────────────────────────────────────────
     st.markdown('<div class="section-header">📊 Market Snapshot</div>', unsafe_allow_html=True)
     ind_cols = st.columns(len(MARKET_INDICATORS))
     for i, (name, symbol) in enumerate(MARKET_INDICATORS.items()):
         with ind_cols[i]:
-            _render_market_indicator(name, symbol, market_data)
+            _render_indicator(name, symbol, market_data)
 
-    # ── Sector heatmap ─────────────────────────────────────────────────────
+    # ── Sectors ────────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">🗂️ Sector Performance</div>', unsafe_allow_html=True)
     sec_cols = st.columns(6)
     for i, (name, symbol) in enumerate(SECTOR_ETFS.items()):
         with sec_cols[i % 6]:
-            _render_market_indicator(name, symbol, market_data)
+            _render_indicator(name, symbol, market_data)
 
     # ── Key themes ─────────────────────────────────────────────────────────
     themes = summary.get("key_themes", [])
@@ -381,12 +387,12 @@ def _display_summary(summary: dict, market_data: dict, articles: list):
         t_cols = st.columns(min(len(themes), 3))
         impact_color = {"POSITIVE": "#4ade80", "NEGATIVE": "#f87171", "NEUTRAL": "#94a3b8"}
         for i, theme in enumerate(themes):
+            ic = impact_color.get(theme.get("impact", "NEUTRAL"), "#94a3b8")
+            sectors_str = ", ".join(theme.get("affected_sectors", []))
             with t_cols[i % 3]:
-                ic = impact_color.get(theme.get("impact", "NEUTRAL"), "#94a3b8")
-                sectors_str = ", ".join(theme.get("affected_sectors", []))
                 st.markdown(f"""
                 <div style="background:#0d1b2a;border:1px solid {ic}55;border-radius:10px;
-                            padding:0.9rem 1rem;height:100%;">
+                            padding:0.9rem 1rem;height:100%;margin-bottom:0.5rem;">
                     <div style="font-weight:700;color:{ic};font-size:0.9rem;margin-bottom:0.4rem;">
                         {theme.get('theme','')}
                     </div>
@@ -402,19 +408,17 @@ def _display_summary(summary: dict, market_data: dict, articles: list):
     if tickers_to_watch:
         st.markdown('<div class="section-header">🎯 Top Tickers to Watch Today</div>', unsafe_allow_html=True)
         for tw in tickers_to_watch:
-            action    = tw.get("action", "WATCH")
-            conf      = tw.get("confidence", "LOW")
-            action_colors = {"BUY": "🟢", "SHORT": "🔴", "HOLD": "🟡", "WATCH": "🔵"}
-            conf_icon = {"HIGH": "🔵", "MEDIUM": "🟡", "LOW": "🔘"}.get(conf, "🔘")
-            dot       = action_colors.get(action, "⚪")
-            emoji     = {"BUY": "📈", "SHORT": "📉", "HOLD": "➡️", "WATCH": "👁️"}.get(action, "👁️")
-
+            action = tw.get("action", "WATCH")
+            conf   = tw.get("confidence", "LOW")
+            dot    = {"BUY": "🟢", "SHORT": "🔴", "HOLD": "🟡", "WATCH": "🔵"}.get(action, "⚪")
+            emoji  = {"BUY": "📈", "SHORT": "📉", "HOLD": "➡️", "WATCH": "👁️"}.get(action, "👁️")
+            ci     = {"HIGH": "🔵", "MEDIUM": "🟡", "LOW": "🔘"}.get(conf, "🔘")
             tc1, tc2 = st.columns([1, 5])
             with tc1:
                 st.markdown(f"**`{tw.get('ticker','?')}`**")
                 st.caption(tw.get("company", ""))
                 st.markdown(f"{dot} **{action}** {emoji}")
-                st.caption(f"{conf_icon} {conf}")
+                st.caption(f"{ci} {conf}")
             with tc2:
                 st.markdown(f"**{tw.get('reasoning','')}**")
                 st.caption(f"⚡ Catalyst: {tw.get('catalyst','')}")
@@ -438,9 +442,7 @@ def _display_summary(summary: dict, market_data: dict, articles: list):
                         {si} {so.get('sector','')}
                         <span style="color:#6b8fad;font-size:0.75rem;"> · {so.get('etf','')}</span>
                     </div>
-                    <div style="color:#c9d8e8;font-size:0.8rem;margin-top:0.3rem;">
-                        {so.get('reasoning','')}
-                    </div>
+                    <div style="color:#c9d8e8;font-size:0.8rem;margin-top:0.3rem;">{so.get('reasoning','')}</div>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -450,21 +452,18 @@ def _display_summary(summary: dict, market_data: dict, articles: list):
         st.markdown('<div class="section-header">📋 Your Watchlist Signals</div>', unsafe_allow_html=True)
         ws_cols = st.columns(min(len(watchlist_signals), 4))
         for i, ws in enumerate(watchlist_signals):
-            sig    = ws.get("signal", "WATCH")
-            conf   = ws.get("confidence", "LOW")
-            dot    = {"BUY": "🟢", "SHORT": "🔴", "HOLD": "🟡", "WATCH": "🔵"}.get(sig, "⚪")
-            ci     = {"HIGH": "🔵", "MEDIUM": "🟡", "LOW": "🔘"}.get(conf, "🔘")
+            sig  = ws.get("signal", "WATCH")
+            conf = ws.get("confidence", "LOW")
+            dot  = {"BUY": "🟢", "SHORT": "🔴", "HOLD": "🟡", "WATCH": "🔵"}.get(sig, "⚪")
+            ci   = {"HIGH": "🔵", "MEDIUM": "🟡", "LOW": "🔘"}.get(conf, "🔘")
             with ws_cols[i % 4]:
                 st.markdown(f"""
                 <div style="background:#0d1b2a;border:1px solid #1e3a5f;border-radius:10px;
                             padding:0.8rem;text-align:center;margin-bottom:0.5rem;">
-                    <div style="font-family:'Space Mono',monospace;font-size:1.1rem;
-                                color:#38bdf8;font-weight:700;">{ws.get('ticker','?')}</div>
+                    <div style="font-family:'Space Mono',monospace;font-size:1.1rem;color:#38bdf8;font-weight:700;">{ws.get('ticker','?')}</div>
                     <div style="font-size:0.9rem;font-weight:700;">{dot} {sig}</div>
                     <div style="font-size:0.75rem;color:#6b8fad;">{ci} {conf}</div>
-                    <div style="font-size:0.78rem;color:#94a3b8;margin-top:0.3rem;">
-                        {ws.get('notes','')[:80]}
-                    </div>
+                    <div style="font-size:0.78rem;color:#94a3b8;margin-top:0.3rem;">{ws.get('notes','')[:80]}</div>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -494,10 +493,10 @@ def _display_summary(summary: dict, market_data: dict, articles: list):
         </div>
         """, unsafe_allow_html=True)
 
-    # ── News feed used ─────────────────────────────────────────────────────
+    # ── Articles used ──────────────────────────────────────────────────────
     with st.expander(f"📰 {len(articles)} articles used in this briefing"):
         for art in articles:
             st.markdown(f"- [{art['title']}]({art['url']}) — *{art['source']}*")
 
     gen_time = st.session_state.get("market_summary_time", "")
-    st.caption(f"⏱ Briefing generated at {gen_time}  ·  ⚠️ Not financial advice")
+    st.caption(f"⏱ Briefing generated at {gen_time}  ·  ⚠️ Not financial advice  ·  Prices show most recent available close")

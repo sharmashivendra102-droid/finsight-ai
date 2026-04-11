@@ -127,6 +127,8 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 📡 Live Feed Settings")
     refresh_interval = st.slider("Refresh interval (seconds)", 15, 120, 30, 5)
+    max_age_hours    = st.slider("Max article age (hours)", 1, 72, 24, 1,
+                                 help="Only show articles published within this many hours. Set to 2-4 for breaking news only, 24 for full day coverage.")
     st.markdown("---")
     st.markdown("### 🧠 Workflow")
     st.markdown("""
@@ -161,8 +163,11 @@ tabs = st.tabs([
     "📡  Live Intelligence",
     "🎯  Ticker Signals",
     "🔬  Backtesting",
+    "💼  Portfolio Tracker",
+    "📜  Signal History",
+    "📧  Email Alerts",
 ])
-tab_brief, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = tabs
+tab_brief, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = tabs
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 0 — MARKET BRIEFING
@@ -259,7 +264,7 @@ with tab5:
         if AUTOREFRESH_AVAILABLE and st.session_state.get("live_running", False):
             st_autorefresh(interval=refresh_interval * 1000, key="live_refresh")
         from modules.live_news_engine import run_live_news
-        run_live_news(api_key=GROQ_API_KEY, refresh_interval=refresh_interval)
+        run_live_news(api_key=GROQ_API_KEY, refresh_interval=refresh_interval, max_age_hours=max_age_hours)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 6 — TICKER SIGNALS
@@ -280,3 +285,26 @@ with tab7:
     st.markdown('<div class="section-header">🔬 Walk-Forward Backtester</div>', unsafe_allow_html=True)
     from modules.backtest_engine import run_backtest
     run_backtest()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 8 — PORTFOLIO TRACKER
+# ═══════════════════════════════════════════════════════════════════════════
+with tab8:
+    st.markdown('<div class="section-header">💼 Portfolio P&L Tracker</div>', unsafe_allow_html=True)
+    from modules.portfolio_tracker import run_portfolio_tracker
+    run_portfolio_tracker()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 9 — SIGNAL HISTORY
+# ═══════════════════════════════════════════════════════════════════════════
+with tab9:
+    st.markdown('<div class="section-header">📜 Signal History Log</div>', unsafe_allow_html=True)
+    from modules.signal_history import run_signal_history
+    run_signal_history()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 10 — EMAIL ALERTS SETUP
+# ═══════════════════════════════════════════════════════════════════════════
+with tab10:
+    from modules.email_alerts import render_email_setup
+    render_email_setup()
