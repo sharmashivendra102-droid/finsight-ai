@@ -150,7 +150,7 @@ with st.sidebar:
 st.markdown("""
 <div style="padding: 1.5rem 0 1rem;">
   <div class="hero-title">📈 FinSight AI</div>
-  <div class="hero-sub">Briefing · Correlations · Sentiment · Risk · AI Advisor · Live News · Ticker Signals · Backtesting</div>
+  <div class="hero-sub">Briefing · Correlations · Sentiment · Risk · AI Advisor · Live News · Ticker Signals · Backtesting · Portfolio · Signal History · Email Alerts</div>
 </div>
 """, unsafe_allow_html=True)
 
