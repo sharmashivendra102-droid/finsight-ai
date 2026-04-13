@@ -150,11 +150,12 @@ with st.sidebar:
     st.markdown("### 🧭 Quick Navigation")
     st.markdown("""
     <div style="color:#6b8fad;font-size:0.8rem;line-height:2;">
-    ☕ <b>Market Briefing</b> — Start here daily<br>
-    📡 <b>Live Intelligence</b> — Real-time signals<br>
+    ☕ <b>Briefing</b> — Start here daily<br>
+    📡 <b>Live Feed</b> — Real-time signals<br>
     🎯 <b>Ticker Signals</b> — Look up any ticker<br>
-    💼 <b>Portfolio</b> — Your holdings & P&L<br>
+    💼 <b>Portfolio</b> — Holdings & P&L<br>
     📈 <b>Performance</b> — Signal track record<br>
+    🔮 <b>Live Strategy</b> — Trade signals now<br>
     📊 <b>Correlations</b> — Asset relationships<br>
     🧠 <b>AI Advisor</b> — Chat with your data<br>
     🔬 <b>Backtest</b> — Strategy testing
@@ -186,6 +187,7 @@ tabs = st.tabs([
     "🎯 Ticker Signals",
     "💼 Portfolio",
     "📈 Performance",
+    "🔮 Live Strategy",
     "📊 Correlations",
     "📰 Sentiment",
     "⚠️ Risk",
@@ -194,7 +196,7 @@ tabs = st.tabs([
     "📜 Signal Log",
     "📧 Alerts",
 ])
-(tab_brief, tab_live, tab_ticker, tab_port, tab_perf,
+(tab_brief, tab_live, tab_ticker, tab_port, tab_perf, tab_strat,
  tab_corr, tab_sent, tab_risk, tab_adv, tab_bt, tab_log, tab_email) = tabs
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -375,6 +377,22 @@ with tab_adv:
     else:
         from modules.advisor_engine import run_advisor
         run_advisor(groq_api_key=GROQ_API_KEY)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🔮 LIVE STRATEGY SIGNALS
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_strat:
+    st.markdown('<div class="section-header">🔮 Live Strategy Signals</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="insight-card">
+    Applies your chosen backtested strategy to <b>current market data</b> to generate a real,
+    actionable trade signal right now. Shows entry price, stop loss, take profit,
+    risk/reward ratio, and the exact indicator values driving the signal.
+    Signals are saved to Signal History and tracked in Performance.
+    </div>
+    """, unsafe_allow_html=True)
+    from modules.strategy_signals import run_strategy_signals
+    run_strategy_signals()
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 🔬 BACKTESTING
