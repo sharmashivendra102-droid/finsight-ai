@@ -156,6 +156,7 @@ with st.sidebar:
     💼 <b>Portfolio</b> — Holdings & P&L<br>
     📈 <b>Performance</b> — Signal track record<br>
     🔮 <b>Live Strategy</b> — Trade signals now<br>
+    🧪 <b>Simulator</b> — Historical sim<br>
     📊 <b>Correlations</b> — Asset relationships<br>
     🧠 <b>AI Advisor</b> — Chat with your data<br>
     🔬 <b>Backtest</b> — Strategy testing
@@ -188,6 +189,7 @@ tabs = st.tabs([
     "💼 Portfolio",
     "📈 Performance",
     "🔮 Live Strategy",
+    "🧪 Simulator",
     "📊 Correlations",
     "📰 Sentiment",
     "⚠️ Risk",
@@ -196,7 +198,7 @@ tabs = st.tabs([
     "📜 Signal Log",
     "📧 Alerts",
 ])
-(tab_brief, tab_live, tab_ticker, tab_port, tab_perf, tab_strat,
+(tab_brief, tab_live, tab_ticker, tab_port, tab_perf, tab_strat, tab_sim,
  tab_corr, tab_sent, tab_risk, tab_adv, tab_bt, tab_log, tab_email) = tabs
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -291,6 +293,22 @@ with tab_perf:
     """, unsafe_allow_html=True)
     from modules.signal_performance import run_signal_performance
     run_signal_performance()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🧪 STRATEGY SIMULATOR
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_sim:
+    st.markdown('<div class="section-header">🧪 Strategy Simulator</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="insight-card">
+    Runs a rigorous walk-forward historical simulation across multiple tickers and strategies.
+    Tests MA Crossover, RSI, Momentum, and ML Weekly on real price data.
+    Shows accuracy %, statistical significance (p-values), equity curves, and the best
+    (strategy, ticker, time horizon) combinations to focus on in Live Strategy.
+    </div>
+    """, unsafe_allow_html=True)
+    from modules.auto_evaluator import run_auto_evaluator
+    run_auto_evaluator()
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 📊 CORRELATION ANALYTICS
