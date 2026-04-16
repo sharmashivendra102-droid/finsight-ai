@@ -1,9 +1,17 @@
 """
 Signal Performance Tracker
-===========================
-Fetches price at signal time and compares to price N days later.
-BUY correct = price went up. SHORT correct = price went down.
-HOLD/WATCH excluded from accuracy (no directional bet).
+============================
+Evaluates every BUY/SHORT signal against real price outcomes.
+Critically: each signal is only evaluated when enough time has passed
+to match its stated time horizon. Signals not ready yet are shown
+separately and clearly labeled.
+
+Horizon matching:
+  INTRADAY        → needs 1 day to pass
+  SWING (1-5 days)→ needs 5 days to pass
+  MEDIUM (weeks)  → needs 14 days to pass
+  LONG (months)   → needs 30 days to pass
+  Unknown         → needs 5 days (conservative default)
 """
 
 import streamlit as st
@@ -32,6 +40,34 @@ TEXT   = "#c9d8e8"
 MUTED  = "#6b8fad"
 PURPLE = "#a78bfa"
 
+# ── Horizon parsing ────────────────────────────────────────────────────────
+HORIZON_MAP = {
+    "INTRADAY":          1,
+    "SWING (1-5 DAYS)":  5,
+    "SWING":             5,
+    "MEDIUM (WEEKS)":    14,
+    "MEDIUM":            14,
+    "LONG (MONTHS)":     30,
+    "LONG":              30,
+}
+
+def _horizon_days(horizon_str: str) -> int:
+    if not horizon_str:
+        return 5
+    key = str(horizon_str).upper().strip()
+    if key in HORIZON_MAP:
+        return HORIZON_MAP[key]
+    for k, v in HORIZON_MAP.items():
+        if k in key:
+            return v
+    return 5
+
+def _horizon_label(days: int) -> str:
+    if days <= 1:  return "Intraday (1d)"
+    if days <= 5:  return "Swing (5d)"
+    if days <= 14: return "Medium (14d)"
+    return "Long (30d)"
+
 
 def _style_fig(fig, ax_list):
     fig.patch.set_facecolor(CARD)
@@ -47,483 +83,380 @@ def _style_fig(fig, ax_list):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_price_on_date(ticker: str, target_date: str) -> float | None:
-    """Get closing price for a ticker on or after a given date."""
+def _fetch_price(ticker: str, date_str: str) -> float | None:
     import yfinance as yf
     try:
-        dt    = pd.to_datetime(target_date)
+        dt    = pd.to_datetime(date_str)
         start = (dt - timedelta(days=3)).strftime("%Y-%m-%d")
         end   = (dt + timedelta(days=5)).strftime("%Y-%m-%d")
-        hist  = yf.Ticker(ticker).history(start=start, end=end)
+        hist  = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
         if hist.empty:
             return None
         closes = hist["Close"].dropna()
-        if closes.empty:
-            return None
-        # Get closest price on or after signal date
+        closes.index = pd.to_datetime(closes.index).tz_localize(None)
         after = closes[closes.index.date >= dt.date()]
-        if not after.empty:
-            return float(after.iloc[0])
-        return float(closes.iloc[-1])
+        return float(after.iloc[0]) if not after.empty else float(closes.iloc[-1])
     except Exception:
         return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _fetch_current_price(ticker: str) -> float | None:
-    import yfinance as yf
-    try:
-        hist = yf.Ticker(ticker).history(period="5d")
-        closes = hist["Close"].dropna()
-        return float(closes.iloc[-1]) if not closes.empty else None
-    except Exception:
-        return None
-
-
-def _load_signals(days_back: int = 30) -> pd.DataFrame:
+def _load_signals(days_back: int, source_filter: list = None,
+                  action_filter: list = None) -> pd.DataFrame:
     try:
         conn   = sqlite3.connect(str(DB_PATH), check_same_thread=False)
         cutoff = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
         df     = pd.read_sql_query(
-            "SELECT * FROM signals WHERE timestamp >= ? ORDER BY timestamp DESC",
+            "SELECT * FROM signals WHERE timestamp >= ? AND action IN ('BUY','SHORT') ORDER BY timestamp DESC",
             conn, params=(cutoff,)
         )
         conn.close()
-        return df
     except Exception:
         return pd.DataFrame()
 
+    if source_filter and df.empty is False:
+        df = df[df["source"].isin(source_filter)]
+    if action_filter and df.empty is False:
+        df = df[df["action"].isin(action_filter)]
+    return df
 
-def _evaluate_signals(df: pd.DataFrame, outcome_days: int) -> pd.DataFrame:
+
+def _evaluate(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    For each BUY/SHORT signal, fetch entry price and outcome price.
-    Determine correct/incorrect based on direction.
+    Split signals into:
+      - ready_df:   horizon window has passed → evaluate
+      - waiting_df: horizon window not yet passed → not ready
+
+    Returns (ready_df_with_outcomes, waiting_df)
     """
-    if df.empty:
-        return pd.DataFrame()
+    now     = datetime.now()
+    ready   = []
+    waiting = []
 
-    # Only evaluate directional signals
-    directional = df[df["action"].isin(["BUY", "SHORT"])].copy()
-    if directional.empty:
-        return pd.DataFrame()
+    total = len(df)
+    prog  = st.progress(0, text="Evaluating signals…")
 
-    results = []
-    cutoff_date = datetime.now() - timedelta(days=outcome_days)
+    for i, (_, row) in enumerate(df.iterrows()):
+        prog.progress((i + 1) / total,
+                      text=f"Checking {row['ticker']} — {row['timestamp'][:10]} ({i+1}/{total})")
 
-    progress = st.progress(0, text="Evaluating signal outcomes…")
-    total = len(directional)
+        sig_dt       = pd.to_datetime(row["timestamp"])
+        horizon_days = _horizon_days(row.get("time_horizon", ""))
+        days_elapsed = (now - sig_dt).days
 
-    for i, (_, row) in enumerate(directional.iterrows()):
-        progress.progress((i + 1) / total,
-                          text=f"Checking {row['ticker']} signal from {row['timestamp'][:10]}…")
+        base = {
+            "timestamp":     row["timestamp"],
+            "date":          row["timestamp"][:10],
+            "ticker":        row["ticker"],
+            "action":        row["action"],
+            "confidence":    row["confidence"],
+            "source":        row["source"],
+            "time_horizon":  row.get("time_horizon", ""),
+            "horizon_days":  horizon_days,
+            "days_elapsed":  days_elapsed,
+            "reasoning":     str(row.get("reasoning", ""))[:100],
+            "article":       str(row.get("article_title", ""))[:70],
+        }
 
-        sig_dt = pd.to_datetime(row["timestamp"])
-        ticker = row["ticker"]
+        if days_elapsed < horizon_days:
+            # Not enough time has passed — do not evaluate
+            remaining = horizon_days - days_elapsed
+            base["ready_in"] = f"{remaining} day{'s' if remaining != 1 else ''}"
+            waiting.append(base)
+            continue
 
-        # Entry price — price on signal date
-        entry_price = _fetch_price_on_date(ticker, row["timestamp"][:10])
+        # Fetch entry and outcome prices
+        entry_price = _fetch_price(row["ticker"], row["timestamp"][:10])
+        if entry_price is None or entry_price <= 0:
+            waiting.append({**base, "ready_in": "price data unavailable"})
+            continue
 
-        # Outcome — only evaluate if signal is old enough
-        if sig_dt > cutoff_date:
-            outcome_status = "pending"
-            outcome_price  = None
-            return_pct     = None
-            correct        = None
-        else:
-            outcome_date  = (sig_dt + timedelta(days=outcome_days)).strftime("%Y-%m-%d")
-            outcome_price = _fetch_price_on_date(ticker, outcome_date)
+        outcome_date  = (sig_dt + timedelta(days=horizon_days)).strftime("%Y-%m-%d")
+        outcome_price = _fetch_price(row["ticker"], outcome_date)
+        if outcome_price is None or outcome_price <= 0:
+            waiting.append({**base, "ready_in": "outcome price unavailable"})
+            continue
 
-            if entry_price and outcome_price and entry_price > 0:
-                return_pct = (outcome_price - entry_price) / entry_price * 100
-                if row["action"] == "BUY":
-                    correct = return_pct > 0
-                else:  # SHORT
-                    correct = return_pct < 0
-                outcome_status = "correct" if correct else "incorrect"
-            else:
-                outcome_status = "no_data"
-                return_pct     = None
-                correct        = None
+        raw_ret = (outcome_price - entry_price) / entry_price * 100
+        # For SHORT: profit when price falls
+        pnl_ret = raw_ret if row["action"] == "BUY" else -raw_ret
+        correct = int(pnl_ret > 0)
 
-        results.append({
-            "timestamp":      row["timestamp"],
-            "ticker":         ticker,
-            "action":         row["action"],
-            "confidence":     row["confidence"],
-            "source":         row["source"],
-            "reasoning":      row["reasoning"][:80] if row.get("reasoning") else "",
-            "article":        row["article_title"][:60] if row.get("article_title") else "",
-            "entry_price":    entry_price,
-            "outcome_price":  outcome_price,
-            "return_pct":     return_pct,
-            "correct":        correct,
-            "outcome_status": outcome_status,
+        ready.append({
+            **base,
+            "entry_price":   round(entry_price, 2),
+            "outcome_price": round(outcome_price, 2),
+            "return_pct":    round(pnl_ret, 3),
+            "correct":       correct,
+            "outcome":       "✅ Correct" if correct else "❌ Incorrect",
         })
 
-    progress.empty()
-    return pd.DataFrame(results)
-
-
-def _compute_stats(perf_df: pd.DataFrame) -> dict:
-    if perf_df.empty:
-        return {}
-
-    evaluated = perf_df[perf_df["outcome_status"].isin(["correct", "incorrect"])]
-    pending   = perf_df[perf_df["outcome_status"] == "pending"]
-
-    if evaluated.empty:
-        return {"pending_only": True, "pending_count": len(pending)}
-
-    total_eval = len(evaluated)
-    correct    = evaluated["correct"].sum()
-    accuracy   = correct / total_eval * 100 if total_eval > 0 else 0
-
-    # By confidence
-    conf_stats = {}
-    for conf in ["HIGH", "MEDIUM", "LOW"]:
-        sub = evaluated[evaluated["confidence"] == conf]
-        if len(sub) > 0:
-            conf_stats[conf] = {
-                "total":    len(sub),
-                "correct":  int(sub["correct"].sum()),
-                "accuracy": sub["correct"].mean() * 100,
-            }
-
-    # By action
-    action_stats = {}
-    for action in ["BUY", "SHORT"]:
-        sub = evaluated[evaluated["action"] == action]
-        if len(sub) > 0:
-            action_stats[action] = {
-                "total":    len(sub),
-                "correct":  int(sub["correct"].sum()),
-                "accuracy": sub["correct"].mean() * 100,
-            }
-
-    # By source
-    source_stats = {}
-    for src in evaluated["source"].unique():
-        sub = evaluated[evaluated["source"] == src]
-        if len(sub) > 0:
-            source_stats[src] = {
-                "total":    len(sub),
-                "accuracy": sub["correct"].mean() * 100,
-            }
-
-    # Average return on correct signals
-    correct_rets  = evaluated[evaluated["correct"] == True]["return_pct"].dropna()
-    incorrect_rets= evaluated[evaluated["correct"] == False]["return_pct"].dropna()
-    avg_win  = float(correct_rets.abs().mean())  if not correct_rets.empty  else 0
-    avg_loss = float(incorrect_rets.abs().mean()) if not incorrect_rets.empty else 0
-
-    # Best/worst signals
-    best  = evaluated.nlargest(3,  "return_pct")[["ticker","action","return_pct","confidence","timestamp"]]
-    worst = evaluated.nsmallest(3, "return_pct")[["ticker","action","return_pct","confidence","timestamp"]]
-
-    return {
-        "total_evaluated": total_eval,
-        "total_correct":   int(correct),
-        "accuracy":        accuracy,
-        "pending_count":   len(pending),
-        "conf_stats":      conf_stats,
-        "action_stats":    action_stats,
-        "source_stats":    source_stats,
-        "avg_win":         avg_win,
-        "avg_loss":        avg_loss,
-        "best_signals":    best,
-        "worst_signals":   worst,
-    }
+    prog.empty()
+    return pd.DataFrame(ready), pd.DataFrame(waiting)
 
 
 def run_signal_performance():
 
     st.markdown("""
     <div class="insight-card">
-        <b style="color:#7dd3fc;">Signal accuracy tracked automatically — every BUY and SHORT signal is evaluated against real price outcomes.</b><br>
+        <b style="color:#7dd3fc;">Every signal evaluated against real price outcomes — matched to its stated time horizon.</b><br>
         <span style="color:#6b8fad;font-size:0.9rem;">
-        Entry price is recorded at signal time. Outcome is checked after your chosen evaluation window.
-        HOLD and WATCH signals are excluded (no directional bet to evaluate).
-        The more signals accumulate over time, the more statistically meaningful these numbers become.
+        A signal is only evaluated once enough time has passed to match its time horizon.
+        INTRADAY signals need 1 day. SWING needs 5 days. MEDIUM needs 14. LONG needs 30.
+        Signals that haven't reached their window yet are shown separately as "Not Ready."
+        HOLD and WATCH signals are excluded — they make no directional prediction.
         </span>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Controls ───────────────────────────────────────────────────────────
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        days_back = st.selectbox(
-            "Signals from last…",
-            [7, 14, 30, 60, 90],
-            index=2,
-            format_func=lambda x: f"{x} days"
+    # ── Filters ────────────────────────────────────────────────────────────
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        days_back = st.selectbox("Signals from last", [7, 14, 30, 60, 90, 365],
+                                 index=2, format_func=lambda x: f"{x} days", key="sp_days")
+    with f2:
+        src_filter = st.multiselect(
+            "Source",
+            ["live_intelligence", "ticker_signals", "market_briefing",
+             "strategy_signals", "auto_evaluator"],
+            default=["live_intelligence", "ticker_signals", "market_briefing",
+                     "strategy_signals", "auto_evaluator"],
+            key="sp_src"
         )
-    with c2:
-        outcome_days = st.selectbox(
-            "Evaluate outcome after…",
-            [1, 3, 5, 7, 14],
-            index=1,
-            format_func=lambda x: f"{x} day{'s' if x > 1 else ''}"
-        )
-    with c3:
-        conf_filter = st.multiselect(
-            "Confidence levels",
-            ["HIGH", "MEDIUM", "LOW"],
-            default=["HIGH", "MEDIUM", "LOW"]
-        )
+    with f3:
+        act_filter = st.multiselect("Action", ["BUY", "SHORT"],
+                                    default=["BUY", "SHORT"], key="sp_act")
 
-    run_btn = st.button("🔄 Evaluate Signal Performance", key="run_perf",
-                        use_container_width=False)
+    run_btn = st.button("🔄 Evaluate All Signals", key="sp_run")
 
-    if not run_btn and not st.session_state.get("perf_results"):
-        st.info("👆 Click **Evaluate Signal Performance** to analyse your signal track record. "
-                "This fetches historical prices for every signal — may take 30–60 seconds.")
+    if not run_btn and st.session_state.get("sp_ready") is None:
+        st.info("Click **Evaluate All Signals** to compute accuracy against real market outcomes.")
         return
 
     if run_btn:
-        df_raw = _load_signals(days_back=days_back)
+        df_raw = _load_signals(days_back, src_filter or None, act_filter or None)
         if df_raw.empty:
-            st.warning("No signals in the database yet. Run Live Intelligence or Ticker Signals first to build history.")
+            st.warning("No signals found matching your filters. Run Live News Feed and Ticker Signals to build history.")
             return
+        with st.spinner(f"Fetching prices for {len(df_raw)} signals…"):
+            ready_df, waiting_df = _evaluate(df_raw)
+        st.session_state["sp_ready"]   = ready_df
+        st.session_state["sp_waiting"] = waiting_df
 
-        if conf_filter:
-            df_raw = df_raw[df_raw["confidence"].isin(conf_filter)]
+    ready_df   = st.session_state.get("sp_ready",   pd.DataFrame())
+    waiting_df = st.session_state.get("sp_waiting", pd.DataFrame())
 
-        perf_df = _evaluate_signals(df_raw, outcome_days)
-        st.session_state["perf_results"]     = perf_df
-        st.session_state["perf_stats"]       = _compute_stats(perf_df)
-        st.session_state["perf_outcome_days"]= outcome_days
-        st.session_state["perf_days_back"]   = days_back
+    # ── Waiting / not ready signals ────────────────────────────────────────
+    if not waiting_df.empty:
+        with st.expander(f"⏳ {len(waiting_df)} signal(s) not ready for evaluation yet", expanded=False):
+            st.caption("These signals haven't reached their time horizon window. They'll be evaluable once enough time passes.")
+            show_cols = ["date", "ticker", "action", "confidence", "time_horizon",
+                         "horizon_days", "days_elapsed", "ready_in", "source"]
+            show_cols = [c for c in show_cols if c in waiting_df.columns]
 
-    perf_df     = st.session_state.get("perf_results", pd.DataFrame())
-    stats       = st.session_state.get("perf_stats", {})
-    outcome_days= st.session_state.get("perf_outcome_days", 3)
-    days_back   = st.session_state.get("perf_days_back", 30)
+            def c_act(v): return f"color:{GREEN}" if v=="BUY" else f"color:{RED}"
+            sty = waiting_df[show_cols].style.map(c_act, subset=["action"]) \
+                      if "action" in show_cols else waiting_df[show_cols].style
+            st.dataframe(sty, use_container_width=True, hide_index=True)
 
-    if perf_df.empty or not stats:
-        st.info("No evaluated signals yet.")
+    if ready_df.empty:
+        st.warning("No signals are ready for evaluation yet — none have reached their stated time horizon. "
+                   "Check back once signals have had time to play out.")
         return
 
-    if stats.get("pending_only"):
-        st.warning(f"All {stats['pending_count']} signals are less than {outcome_days} day(s) old — "
-                   f"outcomes not yet available. Check back after the evaluation window passes.")
-        return
-
-    # ── Headline accuracy banner ───────────────────────────────────────────
-    acc   = stats["accuracy"]
-    total = stats["total_evaluated"]
-    corr  = stats["total_correct"]
-
-    acc_color = GREEN if acc >= 60 else (AMBER if acc >= 50 else RED)
-    acc_label = "Strong Edge 🟢" if acc >= 60 else ("Marginal 🟡" if acc >= 50 else "Below Random 🔴")
+    # ── Accuracy banner ────────────────────────────────────────────────────
+    total  = len(ready_df)
+    corr   = int(ready_df["correct"].sum())
+    acc    = corr / total * 100 if total > 0 else 0
+    ac     = GREEN if acc >= 60 else (AMBER if acc >= 50 else RED)
+    label  = "Strong Edge 🟢" if acc >= 60 else ("Marginal 🟡" if acc >= 50 else "Below Random 🔴")
 
     st.markdown(f"""
     <div style="background:linear-gradient(135deg,#0d1b2a,#0f2035);
-                border:2px solid {acc_color}44;border-radius:16px;
-                padding:1.5rem 2rem;margin:1rem 0;text-align:center;">
-        <div style="font-family:'Space Mono',monospace;font-size:3rem;
-                    font-weight:700;color:{acc_color};">{acc:.1f}%</div>
-        <div style="color:#c9d8e8;font-size:1.1rem;margin-top:0.3rem;">
-            Overall Signal Accuracy — {acc_label}
+                border:2px solid {ac}44;border-radius:16px;
+                padding:1.4rem 2rem;margin:1rem 0;text-align:center;">
+        <div style="font-family:'Space Mono',monospace;font-size:2.8rem;font-weight:700;color:{ac};">{acc:.1f}%</div>
+        <div style="color:#c9d8e8;font-size:1rem;margin-top:0.3rem;">Overall Signal Accuracy — {label}</div>
+        <div style="color:#6b8fad;font-size:0.82rem;margin-top:0.3rem;">
+            {corr} correct out of {total} evaluated · {len(waiting_df)} not ready yet
         </div>
-        <div style="color:#6b8fad;font-size:0.85rem;margin-top:0.4rem;">
-            {corr} correct out of {total} evaluated BUY/SHORT signals
-            · {outcome_days}-day outcome window
-            · Last {days_back} days of signals
-        </div>
-        {"<div style='color:#fbbf24;font-size:0.8rem;margin-top:0.4rem;'>⏳ " + str(stats['pending_count']) + " signals still pending (too recent to evaluate)</div>" if stats.get('pending_count', 0) > 0 else ""}
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Key metrics ────────────────────────────────────────────────────────
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.markdown(f'<div class="metric-box"><div class="label">Avg Win</div><div class="value" style="color:{GREEN};">+{stats["avg_win"]:.1f}%</div></div>', unsafe_allow_html=True)
-    with m2:
-        st.markdown(f'<div class="metric-box"><div class="label">Avg Loss</div><div class="value" style="color:{RED};">-{stats["avg_loss"]:.1f}%</div></div>', unsafe_allow_html=True)
-    with m3:
-        pf = stats["avg_win"] / stats["avg_loss"] if stats["avg_loss"] > 0 else 0
-        pf_color = GREEN if pf > 1 else RED
-        st.markdown(f'<div class="metric-box"><div class="label">Win/Loss Ratio</div><div class="value" style="color:{pf_color};">{pf:.2f}</div></div>', unsafe_allow_html=True)
+    if total < 20:
+        st.warning(f"⚠️ {total} evaluated signals is below the 20-signal minimum for reliable conclusions. Keep running Live Feed and Ticker Signals.")
+
+    # ── Metrics row ────────────────────────────────────────────────────────
+    wins  = ready_df[ready_df["correct"] == 1]["return_pct"]
+    loses = ready_df[ready_df["correct"] == 0]["return_pct"]
+    avg_win  = float(wins.mean())  if not wins.empty  else 0
+    avg_loss = float(loses.mean()) if not loses.empty else 0
+    rr = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    with m1: st.markdown(f'<div class="metric-box"><div class="label">Accuracy</div><div class="value" style="color:{ac};">{acc:.1f}%</div></div>', unsafe_allow_html=True)
+    with m2: st.markdown(f'<div class="metric-box"><div class="label">Avg Win</div><div class="value" style="color:{GREEN};">+{avg_win:.1f}%</div></div>', unsafe_allow_html=True)
+    with m3: st.markdown(f'<div class="metric-box"><div class="label">Avg Loss</div><div class="value" style="color:{RED};">{avg_loss:.1f}%</div></div>', unsafe_allow_html=True)
     with m4:
-        st.markdown(f'<div class="metric-box"><div class="label">Pending</div><div class="value" style="color:{AMBER};">{stats.get("pending_count", 0)}</div></div>', unsafe_allow_html=True)
+        rr_c = GREEN if rr >= 2 else (AMBER if rr >= 1 else RED)
+        st.markdown(f'<div class="metric-box"><div class="label">Win/Loss Ratio</div><div class="value" style="color:{rr_c};">{rr:.2f}</div></div>', unsafe_allow_html=True)
+    with m5: st.markdown(f'<div class="metric-box"><div class="label">Evaluated</div><div class="value">{total}</div></div>', unsafe_allow_html=True)
 
     st.markdown("")
 
-    # ── Accuracy by confidence ─────────────────────────────────────────────
-    conf_stats = stats.get("conf_stats", {})
-    if conf_stats:
-        st.markdown('<div class="section-header">🎯 Accuracy by Confidence Level</div>', unsafe_allow_html=True)
-        st.caption("This is the most important table — HIGH confidence signals should have the highest accuracy.")
-
-        cs_cols = st.columns(len(conf_stats))
-        conf_colors = {"HIGH": BLUE, "MEDIUM": AMBER, "LOW": MUTED}
-        for i, (conf, cs) in enumerate(conf_stats.items()):
-            color = conf_colors.get(conf, MUTED)
-            acc_c = cs["accuracy"]
-            acc_col = GREEN if acc_c >= 60 else (AMBER if acc_c >= 50 else RED)
-            with cs_cols[i]:
+    # ── Breakdown by confidence ────────────────────────────────────────────
+    st.markdown('<div class="section-header">🎯 Accuracy by Confidence Level</div>', unsafe_allow_html=True)
+    st.caption("HIGH confidence signals should consistently beat MEDIUM and LOW. If they don't, the confidence scoring needs tuning.")
+    cc = st.columns(3)
+    conf_colors = {"HIGH": BLUE, "MEDIUM": AMBER, "LOW": MUTED}
+    for i, conf in enumerate(["HIGH", "MEDIUM", "LOW"]):
+        sub = ready_df[ready_df["confidence"] == conf]
+        color = conf_colors[conf]
+        with cc[i]:
+            if len(sub) >= 3:
+                a = sub["correct"].mean() * 100
+                ac2 = GREEN if a >= 60 else (AMBER if a >= 50 else RED)
                 st.markdown(f"""
                 <div style="background:#0d1b2a;border:1px solid {color}44;border-radius:12px;
                             padding:1rem;text-align:center;">
-                    <div style="font-family:'Space Mono',monospace;font-size:0.8rem;color:{color};
-                                font-weight:700;margin-bottom:0.4rem;">{conf} CONFIDENCE</div>
-                    <div style="font-size:2rem;font-weight:700;color:{acc_col};">{acc_c:.1f}%</div>
-                    <div style="color:#6b8fad;font-size:0.8rem;">{cs['correct']}/{cs['total']} correct</div>
-                </div>
-                """, unsafe_allow_html=True)
+                    <div style="font-family:'Space Mono',monospace;font-size:0.75rem;
+                                color:{color};font-weight:700;margin-bottom:0.3rem;">{conf}</div>
+                    <div style="font-size:1.8rem;font-weight:700;color:{ac2};">{a:.1f}%</div>
+                    <div style="color:#6b8fad;font-size:0.75rem;">{int(sub['correct'].sum())}/{len(sub)} correct</div>
+                </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div style="background:#0d1b2a;border:1px solid {color}22;border-radius:12px;
+                            padding:1rem;text-align:center;">
+                    <div style="font-family:'Space Mono',monospace;font-size:0.75rem;color:{color};font-weight:700;">{conf}</div>
+                    <div style="font-size:1.1rem;color:{MUTED};">Need {max(0, 3-len(sub))} more</div>
+                    <div style="color:#6b8fad;font-size:0.72rem;">{len(sub)} signal(s) so far</div>
+                </div>""", unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # ── Breakdown by horizon bucket ────────────────────────────────────────
+    st.markdown('<div class="section-header">⏱ Accuracy by Time Horizon</div>', unsafe_allow_html=True)
+    st.caption("Each signal is matched to its own stated horizon — these are not arbitrary windows.")
+    ready_df["horizon_label"] = ready_df["horizon_days"].apply(_horizon_label)
+    hh = st.columns(4)
+    for i, (label, days) in enumerate([("Intraday (1d)", 1), ("Swing (5d)", 5),
+                                        ("Medium (14d)", 14), ("Long (30d)", 30)]):
+        sub = ready_df[ready_df["horizon_days"] == days]
+        with hh[i]:
+            if len(sub) >= 3:
+                a = sub["correct"].mean() * 100
+                ac3 = GREEN if a >= 60 else (AMBER if a >= 50 else RED)
+                st.markdown(f"""
+                <div class="metric-box">
+                    <div class="label">{label}</div>
+                    <div class="value" style="color:{ac3};">{a:.1f}%</div>
+                    <div style="color:#6b8fad;font-size:0.72rem;">n={len(sub)}</div>
+                </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="metric-box">
+                    <div class="label">{label}</div>
+                    <div class="value" style="color:{MUTED};">—</div>
+                    <div style="color:#6b8fad;font-size:0.72rem;">n={len(sub)} (need 3+)</div>
+                </div>""", unsafe_allow_html=True)
 
     # ── Charts ─────────────────────────────────────────────────────────────
-    evaluated = perf_df[perf_df["outcome_status"].isin(["correct", "incorrect"])]
-
-    if not evaluated.empty:
-        ch1, ch2 = st.columns(2)
-
-        with ch1:
-            st.markdown('<div class="section-header">📊 Accuracy by Action Type</div>', unsafe_allow_html=True)
-            action_stats = stats.get("action_stats", {})
-            if action_stats:
-                fig, ax = plt.subplots(figsize=(5, 3.5))
-                _style_fig(fig, ax)
-                acts  = list(action_stats.keys())
-                accs  = [action_stats[a]["accuracy"] for a in acts]
-                tots  = [action_stats[a]["total"] for a in acts]
-                bcolors = [GREEN if a >= 55 else (AMBER if a >= 50 else RED) for a in accs]
-                bars = ax.bar(acts, accs, color=bcolors, edgecolor=BORDER, linewidth=0.5)
-                ax.axhline(50, color=MUTED, linewidth=1, linestyle="--", label="50% (random)")
-                ax.set_ylim(0, 100)
-                ax.set_ylabel("Accuracy %", color=MUTED, fontsize=8)
-                ax.set_title("Accuracy by Signal Type", color=CYAN, fontsize=10)
-                ax.legend(fontsize=7, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
-                for bar, acc_v, tot in zip(bars, accs, tots):
-                    ax.text(bar.get_x() + bar.get_width()/2, acc_v + 1,
-                            f"{acc_v:.0f}%\n(n={tot})", ha="center", color=TEXT, fontsize=8)
-                fig.tight_layout(); st.pyplot(fig); plt.close(fig)
-
-        with ch2:
-            st.markdown('<div class="section-header">📈 Return Distribution</div>', unsafe_allow_html=True)
-            rets = evaluated["return_pct"].dropna()
-            if not rets.empty:
-                fig, ax = plt.subplots(figsize=(5, 3.5))
-                _style_fig(fig, ax)
-                colors_hist = [GREEN if r >= 0 else RED for r in rets]
-                ax.bar(range(len(rets)), sorted(rets), color=[GREEN if r >= 0 else RED
-                       for r in sorted(rets)], edgecolor=BORDER, linewidth=0.3, width=0.8)
-                ax.axhline(0, color=MUTED, linewidth=0.8)
-                ax.set_title(f"Return % per Signal ({outcome_days}d)", color=CYAN, fontsize=10)
-                ax.set_ylabel("Return %", color=MUTED, fontsize=8)
-                ax.set_xlabel("Signals (sorted)", color=MUTED, fontsize=8)
-                fig.tight_layout(); st.pyplot(fig); plt.close(fig)
-
-    # ── Accuracy over time ─────────────────────────────────────────────────
-    if len(evaluated) >= 5:
-        st.markdown('<div class="section-header">📅 Rolling Accuracy Over Time</div>', unsafe_allow_html=True)
-        ev_time = evaluated.copy()
-        ev_time["date"]    = pd.to_datetime(ev_time["timestamp"]).dt.date
-        ev_time["correct_int"] = ev_time["correct"].astype(int)
-        daily_acc = ev_time.groupby("date").agg(
-            accuracy=("correct_int", "mean"),
-            count=("correct_int", "count")
-        ).reset_index()
-        daily_acc["accuracy"] *= 100
-
-        fig, ax = plt.subplots(figsize=(12, 3))
+    ch1, ch2 = st.columns(2)
+    with ch1:
+        fig, ax = plt.subplots(figsize=(5, 3.5))
         _style_fig(fig, ax)
-        ax.bar(pd.to_datetime(daily_acc["date"]), daily_acc["accuracy"],
-               color=[GREEN if v >= 50 else RED for v in daily_acc["accuracy"]],
-               width=0.8, edgecolor=BORDER, linewidth=0.3)
-        ax.axhline(50, color=MUTED, linewidth=1, linestyle="--", label="50% baseline")
-        ax.set_ylim(0, 110)
-        ax.set_ylabel("Daily Accuracy %", color=MUTED, fontsize=8)
-        ax.set_title("Signal Accuracy by Day", color=CYAN, fontsize=10)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+        confs = ["HIGH", "MEDIUM", "LOW"]
+        accs  = []
+        ns    = []
+        for c in confs:
+            sub = ready_df[ready_df["confidence"] == c]
+            accs.append(sub["correct"].mean() * 100 if len(sub) >= 3 else 0)
+            ns.append(len(sub))
+        bcs = [GREEN if a >= 60 else (AMBER if a >= 50 else RED) for a in accs]
+        bars = ax.bar(confs, accs, color=bcs, edgecolor=BORDER, linewidth=0.4)
+        ax.axhline(50, color=MUTED, linewidth=1, linestyle="--", label="50% (random)")
+        ax.set_ylim(0, 100)
+        ax.set_title("Accuracy by Confidence", color=CYAN, fontsize=9)
+        ax.set_ylabel("Accuracy %", color=MUTED, fontsize=8)
         ax.legend(fontsize=7, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
+        for bar, acc_v, n in zip(bars, accs, ns):
+            if n >= 3:
+                ax.text(bar.get_x() + bar.get_width()/2, acc_v + 1,
+                        f"{acc_v:.0f}%\n(n={n})", ha="center", color=TEXT, fontsize=8)
+            else:
+                ax.text(bar.get_x() + bar.get_width()/2, 5,
+                        f"n={n}", ha="center", color=MUTED, fontsize=7)
         fig.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-    # ── Best / Worst signals ───────────────────────────────────────────────
-    if not evaluated.empty:
-        b1, b2 = st.columns(2)
-        with b1:
-            st.markdown('<div class="section-header">🏆 Best Signals</div>', unsafe_allow_html=True)
-            best = stats.get("best_signals")
-            if best is not None and not best.empty:
-                for _, r in best.iterrows():
-                    ret = r["return_pct"]
-                    sign = "+" if ret >= 0 else ""
-                    action = r["action"]
-                    dot = "🟢" if action == "BUY" else "🔴"
-                    st.markdown(f"""
-                    <div style="background:#041a10;border:1px solid #166534;border-radius:8px;
-                                padding:0.6rem 1rem;margin-bottom:0.4rem;">
-                        <b style="color:#4ade80;">{dot} {r['ticker']} {action}</b>
-                        <span style="color:#4ade80;font-weight:700;float:right;">{sign}{ret:.1f}%</span><br>
-                        <span style="color:#6b8fad;font-size:0.78rem;">{r['confidence']} conf · {str(r['timestamp'])[:10]}</span>
-                    </div>
-                    """, unsafe_allow_html=True)
+    with ch2:
+        rets = ready_df["return_pct"].dropna()
+        if not rets.empty:
+            fig, ax = plt.subplots(figsize=(5, 3.5))
+            _style_fig(fig, ax)
+            ax.hist(rets, bins=15, color=GREEN if rets.mean() > 0 else RED,
+                    edgecolor=BORDER, linewidth=0.4, alpha=0.8)
+            ax.axvline(0,          color=MUTED, linewidth=1, linestyle="--")
+            ax.axvline(rets.mean(), color=CYAN,  linewidth=1.5,
+                       label=f"Mean {rets.mean():+.2f}%")
+            ax.set_title("Return Distribution", color=CYAN, fontsize=9)
+            ax.set_xlabel("Return %", color=MUTED, fontsize=8)
+            ax.legend(fontsize=7, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
+            fig.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-        with b2:
-            st.markdown('<div class="section-header">💀 Worst Signals</div>', unsafe_allow_html=True)
-            worst = stats.get("worst_signals")
-            if worst is not None and not worst.empty:
-                for _, r in worst.iterrows():
-                    ret = r["return_pct"]
-                    sign = "+" if ret >= 0 else ""
-                    action = r["action"]
-                    dot = "🟢" if action == "BUY" else "🔴"
-                    st.markdown(f"""
-                    <div style="background:#1a0a0a;border:1px solid #7f1d1d;border-radius:8px;
-                                padding:0.6rem 1rem;margin-bottom:0.4rem;">
-                        <b style="color:#f87171;">{dot} {r['ticker']} {action}</b>
-                        <span style="color:#f87171;font-weight:700;float:right;">{sign}{ret:.1f}%</span><br>
-                        <span style="color:#6b8fad;font-size:0.78rem;">{r['confidence']} conf · {str(r['timestamp'])[:10]}</span>
-                    </div>
-                    """, unsafe_allow_html=True)
+    # ── Best / worst ───────────────────────────────────────────────────────
+    b1, b2 = st.columns(2)
+    with b1:
+        st.markdown('<div class="section-header">🏆 Best Signals</div>', unsafe_allow_html=True)
+        best = ready_df.nlargest(3, "return_pct")[["ticker","action","confidence","time_horizon","return_pct","date"]]
+        for _, r in best.iterrows():
+            ac4 = GREEN if r["action"] == "BUY" else RED
+            dot = "🟢" if r["action"] == "BUY" else "🔴"
+            st.markdown(f"""
+            <div style="background:#041a10;border:1px solid #166534;border-radius:8px;
+                        padding:0.6rem 1rem;margin-bottom:0.4rem;">
+                <b style="color:{ac4};">{dot} {r['ticker']} {r['action']}</b>
+                <span style="color:{GREEN};font-weight:700;float:right;">+{r['return_pct']:.1f}%</span><br>
+                <span style="color:#6b8fad;font-size:0.75rem;">{r['confidence']} · {r['time_horizon']} · {str(r['date'])[:10]}</span>
+            </div>""", unsafe_allow_html=True)
 
-    # ── Full evaluated table ───────────────────────────────────────────────
+    with b2:
+        st.markdown('<div class="section-header">💀 Worst Signals</div>', unsafe_allow_html=True)
+        worst = ready_df.nsmallest(3, "return_pct")[["ticker","action","confidence","time_horizon","return_pct","date"]]
+        for _, r in worst.iterrows():
+            ac4 = GREEN if r["action"] == "BUY" else RED
+            dot = "🟢" if r["action"] == "BUY" else "🔴"
+            st.markdown(f"""
+            <div style="background:#1a0a0a;border:1px solid #7f1d1d;border-radius:8px;
+                        padding:0.6rem 1rem;margin-bottom:0.4rem;">
+                <b style="color:{ac4};">{dot} {r['ticker']} {r['action']}</b>
+                <span style="color:{RED};font-weight:700;float:right;">{r['return_pct']:.1f}%</span><br>
+                <span style="color:#6b8fad;font-size:0.75rem;">{r['confidence']} · {r['time_horizon']} · {str(r['date'])[:10]}</span>
+            </div>""", unsafe_allow_html=True)
+
+    # ── Full table ─────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">📋 All Evaluated Signals</div>', unsafe_allow_html=True)
-    display_cols = ["timestamp", "ticker", "action", "confidence", "source",
-                    "entry_price", "outcome_price", "return_pct", "outcome_status", "reasoning"]
-    display = perf_df[[c for c in display_cols if c in perf_df.columns]].copy()
+    display_cols = ["date","ticker","action","confidence","time_horizon",
+                    "entry_price","outcome_price","return_pct","outcome","source","reasoning"]
+    display = ready_df[[c for c in display_cols if c in ready_df.columns]].copy()
 
-    def c_status(v):
-        return {
-            "correct":   f"color:{GREEN}",
-            "incorrect": f"color:{RED}",
-            "pending":   f"color:{AMBER}",
-            "no_data":   f"color:{MUTED}",
-        }.get(v, "")
+    def c_act(v):  return f"color:{GREEN}" if v=="BUY"        else f"color:{RED}"
+    def c_out(v):  return f"color:{GREEN}" if "Correct" in str(v) else f"color:{RED}"
     def c_ret(v):
         if pd.isna(v): return ""
-        return f"color:{GREEN}" if v >= 0 else f"color:{RED}"
-    def c_act(v):
-        return {"BUY": f"color:{GREEN}", "SHORT": f"color:{RED}"}.get(v, "")
+        return f"color:{GREEN}" if v > 0 else f"color:{RED}"
 
-    styler = display.style
-    if "outcome_status" in display.columns: styler = styler.map(c_status, subset=["outcome_status"])
-    if "return_pct"     in display.columns: styler = styler.map(c_ret,    subset=["return_pct"])
-    if "action"         in display.columns: styler = styler.map(c_act,    subset=["action"])
-    styler = styler.format({
-        "entry_price":   lambda x: f"${x:.2f}" if pd.notna(x) else "N/A",
-        "outcome_price": lambda x: f"${x:.2f}" if pd.notna(x) else "N/A",
-        "return_pct":    lambda x: f"{x:+.1f}%" if pd.notna(x) else "N/A",
+    sty = display.style
+    if "action"  in display.columns: sty = sty.map(c_act, subset=["action"])
+    if "outcome" in display.columns: sty = sty.map(c_out, subset=["outcome"])
+    if "return_pct" in display.columns: sty = sty.map(c_ret, subset=["return_pct"])
+    sty = sty.format({
+        "entry_price":   "${:.2f}",
+        "outcome_price": "${:.2f}",
+        "return_pct":    lambda x: f"{x:+.2f}%" if pd.notna(x) else "—",
     })
-    st.dataframe(styler, use_container_width=True, hide_index=True)
+    st.dataframe(sty, use_container_width=True, hide_index=True)
 
-    # ── Accuracy interpretation ────────────────────────────────────────────
-    st.markdown('<div class="section-header">🔍 What These Numbers Mean</div>', unsafe_allow_html=True)
-    acc = stats["accuracy"]
-    if total < 20:
-        st.warning(f"⚠️ Only {total} evaluated signals — statistically insufficient. Need 50+ signals for meaningful conclusions. Keep running the app.")
-    elif acc >= 65:
-        st.success(f"🟢 {acc:.1f}% accuracy over {total} signals is genuinely strong. Professional quant funds target 55–60%. If this holds with 100+ signals, you have real edge.")
-    elif acc >= 55:
-        st.info(f"🟡 {acc:.1f}% accuracy over {total} signals shows modest edge above random. Build more signal history to confirm.")
-    elif acc >= 50:
-        st.warning(f"🟡 {acc:.1f}% — marginally above random. Not tradeable with conviction yet. Review which sources/confidence levels perform best.")
-    else:
-        st.error(f"🔴 {acc:.1f}% — below random. Something is wrong with signal quality or the evaluation window doesn't match the time horizon. Try a longer outcome window.")
-
-    csv = perf_df.to_csv(index=False)
-    st.download_button("⬇️ Download performance data as CSV",
-                       data=csv,
+    csv = ready_df.to_csv(index=False)
+    st.download_button("⬇️ Download evaluated signals as CSV", data=csv,
                        file_name=f"signal_performance_{datetime.now().strftime('%Y%m%d')}.csv",
                        mime="text/csv")
