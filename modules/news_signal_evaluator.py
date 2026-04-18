@@ -18,6 +18,19 @@ from scipy import stats as scipy_stats
 import warnings
 warnings.filterwarnings("ignore")
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_ohlc(ticker: str, entry_date: str, exit_date: str, lookback_days: int = 60):
+    import yfinance as yf
+    try:
+        start = (pd.to_datetime(entry_date) - pd.Timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        end   = (pd.to_datetime(exit_date)  + pd.Timedelta(days=3)).strftime("%Y-%m-%d")
+        hist  = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
+        hist.index = pd.to_datetime(hist.index).tz_localize(None)
+        return hist if not hist.empty else None
+    except Exception:
+        return None
+
+
 DB_PATH = Path(__file__).parent.parent / "signal_history.db"
 
 BLUE   = "#38bdf8"
@@ -170,6 +183,12 @@ def run_news_signal_evaluator():
 
     st.info(f"**{len(filtered)} signals** selected. Each evaluated at its own time horizon, closed early if an opposing signal arrives.")
 
+    detect_shocks = st.checkbox(
+        "🌪️ Detect and exclude black swan / external shock events",
+        value=True, key="nse_shocks",
+        help="Signals where the stock moved 3× its normal daily range are flagged inconclusive and excluded from accuracy stats."
+    )
+
     if not st.button("🔬 Evaluate News Signal Accuracy", key="nse_run"):
         if st.session_state.get("nse_ready") is None:
             return
@@ -178,20 +197,30 @@ def run_news_signal_evaluator():
         prog    = st.progress(0, text="Evaluating…")
         def _cb(i, total, ticker, date):
             prog.progress((i+1)/total, text=f"Checking {ticker} — {date} ({i+1}/{total})")
-        ready_df, waiting_df = evaluate_signals(
+        ready_df, waiting_df, inconclusive_df = evaluate_signals(
             df                       = filtered,
-            fetch_price_fn           = _fetch_price,
+            fetch_price_fn           = _get_price,
+            fetch_ohlc_fn            = _fetch_ohlc if detect_shocks else None,
             all_signals_for_timeline = df_full,
             progress_callback        = _cb,
         )
         prog.empty()
-        st.session_state["nse_ready"]   = ready_df
-        st.session_state["nse_waiting"] = waiting_df
-        st.session_state["nse_time"]    = datetime.now().strftime("%H:%M:%S")
+        st.session_state["nse_ready"]         = ready_df
+        st.session_state["nse_waiting"]       = waiting_df
+        st.session_state["nse_inconclusive"]  = inconclusive_df
+        st.session_state["nse_time"]          = datetime.now().strftime("%H:%M:%S")
 
-    ready_df   = st.session_state.get("nse_ready",   pd.DataFrame())
-    waiting_df = st.session_state.get("nse_waiting", pd.DataFrame())
+    ready_df        = st.session_state.get("nse_ready",        pd.DataFrame())
+    waiting_df      = st.session_state.get("nse_waiting",      pd.DataFrame())
+    inconclusive_df = st.session_state.get("nse_inconclusive", pd.DataFrame())
     sup_count  = int(ready_df["superseded"].sum()) if not ready_df.empty and "superseded" in ready_df.columns else 0
+
+    # Show inconclusive if any
+    if not inconclusive_df.empty:
+        with st.expander(f"🌪️ {len(inconclusive_df)} signal(s) excluded — external shock", expanded=False):
+            st.caption("Stock moved 3× normal range during eval window. Not counted in accuracy.")
+            st.dataframe(inconclusive_df[["date","ticker","action","confidence","return_pct","spike_reason"]],
+                         use_container_width=True, hide_index=True)
 
     if not waiting_df.empty:
         with st.expander(f"⏳ {len(waiting_df)} signal(s) not ready yet", expanded=False):
