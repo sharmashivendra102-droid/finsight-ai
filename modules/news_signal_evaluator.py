@@ -199,7 +199,7 @@ def run_news_signal_evaluator():
             prog.progress((i+1)/total, text=f"Checking {ticker} — {date} ({i+1}/{total})")
         ready_df, waiting_df, inconclusive_df = evaluate_signals(
             df                       = filtered,
-            fetch_price_fn           = _get_price,
+            fetch_price_fn           = _fetch_price,
             fetch_ohlc_fn            = _fetch_ohlc if detect_shocks else None,
             all_signals_for_timeline = df_full,
             progress_callback        = _cb,
