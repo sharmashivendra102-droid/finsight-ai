@@ -20,6 +20,7 @@ except Exception:
 import warnings
 warnings.filterwarnings("ignore")
 
+
 st.set_page_config(
     page_title="FinSight AI — Financial Intelligence Platform",
     page_icon="📈",
@@ -184,13 +185,14 @@ tabs = st.tabs([
     "🧠 AI Portfolio Advisor",    # 12 — chat with your data
     "📜 Signal History Log",      # 13 — every signal saved
     "📧 Email Alert Setup",       # 14 — configure alerts
+    "🧠 Signal Profitability",     # 15 — self-improving intelligence
 ])
 
 (tab_brief, tab_live, tab_ticker, tab_port,
  tab_bt, tab_strat, tab_sim,
  tab_sent, tab_nse, tab_perf,
  tab_corr, tab_risk, tab_adv,
- tab_log, tab_email) = tabs
+ tab_log, tab_email, tab_spe) = tabs
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER — standard tab intro card
@@ -444,5 +446,18 @@ with tab_email:
                "will send a formatted email with the article, market impact, and all stock recommendations.")
     from modules.email_alerts import render_email_setup
     render_email_setup()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 15 — 🧠 SIGNAL PROFITABILITY ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_spe:
+    st.markdown('<div class="section-header">🧠 Signal Profitability Engine</div>', unsafe_allow_html=True)
+    _tab_intro("🧠", "Self-improving trading intelligence — which signals actually make money?",
+               "Analyses every evaluated signal by type, market regime (bull/bear/sideways), "
+               "confidence level, and ticker. Computes volatility-adjusted returns and auto-ranks strategies. "
+               "Shows exactly which signal types to keep, watch, or kill.",
+               "The more signal history you have, the more accurate and actionable this becomes.")
+    from modules.signal_profitability import run_signal_profitability
+    run_signal_profitability()
 
 
