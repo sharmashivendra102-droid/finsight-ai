@@ -444,3 +444,5 @@ with tab_email:
                "will send a formatted email with the article, market impact, and all stock recommendations.")
     from modules.email_alerts import render_email_setup
     render_email_setup()
+
+
