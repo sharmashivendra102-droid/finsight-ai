@@ -451,10 +451,10 @@ with st.sidebar:
     train_split    = st.slider("Train Split %", 60, 90, 80)
 
     st.markdown("---")
-    ai_status = "🟢  AI Online" if GROQ_API_KEY else "🔴  No API Key"
-    ai_color  = "#34d399" if GROQ_API_KEY else "#f87171"
+    eng_status = "🟢  Engine Ready" if GROQ_API_KEY else "🔴  Engine Offline"
+    eng_color  = "#34d399" if GROQ_API_KEY else "#f87171"
     st.markdown(f"""
-    <div style="font-family:var(--font-mono);font-size:.72rem;color:{ai_color};">{ai_status}</div>
+    <div style="font-family:var(--font-mono);font-size:.72rem;color:{eng_color};">{eng_status}</div>
     <div style="font-family:var(--font-mono);font-size:.6rem;color:var(--text-muted);
                 margin-top:1rem;line-height:2;">FinSight AI · v1.0<br>Not financial advice</div>
     """, unsafe_allow_html=True)
@@ -626,9 +626,9 @@ with tab_home:
     with s3:
         _metric("Portfolio", f"{port_count}", "var(--accent-violet)", "active positions")
     with s4:
-        ai_c = "var(--accent-green)" if GROQ_API_KEY else "var(--accent-red)"
-        ai_v = "CONNECTED" if GROQ_API_KEY else "OFFLINE"
-        _metric("AI Engine", ai_v, ai_c, "llama-3.3-70b")
+        eng_c = "var(--accent-green)" if GROQ_API_KEY else "var(--accent-red)"
+        eng_v = "ONLINE" if GROQ_API_KEY else "OFFLINE"
+        _metric("Signal Engine", eng_v, eng_c, "analysis ready")
 
     # ── Daily workflow ────────────────────────────────────────────────────
     st.markdown('<div class="section-header">Daily Workflow — click any tile to open that tab</div>',
