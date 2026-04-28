@@ -100,8 +100,8 @@ def log_signal(
             "article_url":   (article_url   or "")[:500],
             "source_feed":   source_feed   or "",
         }).execute()
-    except Exception:
-        pass  # never crash the calling code
+    except Exception as e:
+        st.error(f"❌ {str(e)[:200]}")
 
 
 def log_signals_from_live(article: dict, analysis: dict):
