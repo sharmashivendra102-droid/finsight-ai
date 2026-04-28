@@ -116,7 +116,8 @@ def _format_age(now: datetime, pub_dt: datetime) -> str:
 
 
 def _analyze_with_groq(articles: list, api_key: str) -> list:
-    from groq import Groq
+    import time
+    from groq import Groq, RateLimitError, APIStatusError, APIConnectionError
 
     if not articles:
         return []
@@ -153,25 +154,74 @@ Articles:
 {article_text}"""
 
     client = Groq(api_key=api_key)
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=3000,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
-        match = re.search(r'\[.*\]', raw, re.DOTALL)
-        if match:
-            raw = match.group(0)
-        results = json.loads(raw)
-        if not isinstance(results, list):
-            results = [results]
-        return results
-    except Exception as e:
-        st.warning(f"⚠️ Groq error: {str(e)[:100]}")
-        return []
+    messages = [{"role": "user", "content": prompt}]
+    wait = 8
+
+    for attempt in range(1, 4):
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.2,
+                max_tokens=3000,
+            )
+            raw = response.choices[0].message.content.strip()
+            raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+            match = re.search(r'\[.*\]', raw, re.DOTALL)
+            if match:
+                raw = match.group(0)
+            results = json.loads(raw)
+            if not isinstance(results, list):
+                results = [results]
+            return results
+
+        except RateLimitError:
+            if attempt < 3:
+                st.toast(f"⏳ Live Feed engine busy — retrying in {wait}s ({attempt}/3)", icon="⚡")
+                time.sleep(wait)
+                wait *= 2
+            else:
+                st.warning(
+                    "⚡ **Rate limit reached.** The Live News Feed is processing too many requests. "
+                    "Wait 60 seconds, or reduce the auto-refresh interval in Feed Settings."
+                )
+                return []
+
+        except APIConnectionError:
+            if attempt < 3:
+                st.toast(f"📡 Connection issue — retrying ({attempt}/3)…")
+                time.sleep(4)
+            else:
+                st.error("📡 **Could not connect to the analysis engine.** Check your internet connection.")
+                return []
+
+        except APIStatusError as e:
+            code = getattr(e, "status_code", "?")
+            if code == 503 and attempt < 3:
+                st.toast(f"🔄 Engine temporarily unavailable — retrying ({attempt}/3)…")
+                time.sleep(10)
+            elif code == 401:
+                st.error("🔴 **Invalid API key.** Check your `GROQ_API_KEY` in Streamlit Secrets.")
+                return []
+            else:
+                if attempt < 3:
+                    time.sleep(wait); wait *= 2
+                else:
+                    st.error(f"🔴 **Live Feed engine error (HTTP {code})** — {str(e)[:120]}")
+                    return []
+
+        except json.JSONDecodeError:
+            st.warning("⚠️ Live Feed received a malformed response — skipping this batch.")
+            return []
+
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(wait); wait *= 2
+            else:
+                st.warning(f"⚠️ Live Feed error: {str(e)[:120]}")
+                return []
+
+    return []
 
 
 def _render_signal_card(article: dict, analysis: dict):

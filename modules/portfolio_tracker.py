@@ -5,11 +5,32 @@ correlation matrix for held tickers, news signals from session,
 historical performance chart, and sector breakdown.
 """
 
+"""
+Portfolio Tracker — Supabase backend
+======================================
+Holdings are stored in Supabase (Postgres) so they persist
+across Streamlit Cloud redeploys permanently.
+
+Supabase setup — run this SQL in your Supabase SQL Editor:
+
+    CREATE TABLE holdings (
+      id        BIGSERIAL PRIMARY KEY,
+      ticker    TEXT NOT NULL UNIQUE,
+      shares    REAL NOT NULL,
+      avg_cost  REAL NOT NULL,
+      notes     TEXT,
+      added_at  TEXT
+    );
+
+Then add to Streamlit Secrets:
+    SUPABASE_URL = "https://xxxx.supabase.co"
+    SUPABASE_KEY = "eyJ..."
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import sqlite3
-from pathlib import Path
+import os
 from datetime import datetime
 import matplotlib
 matplotlib.use("Agg")
@@ -17,8 +38,6 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import warnings
 warnings.filterwarnings("ignore")
-
-DB_PATH = Path(__file__).parent.parent / "portfolio.db"
 
 BLUE   = "#38bdf8"
 CYAN   = "#7dd3fc"
@@ -47,53 +66,70 @@ SECTOR_MAP = {
     "TLT":"Bonds","BND":"Bonds","AGG":"Bonds","^GSPC":"Index","^DJI":"Index","^IXIC":"Index",
 }
 
-def _get_conn():
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ── Supabase client ───────────────────────────────────────────────────────────
 
-def _init_db():
-    conn = _get_conn()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS holdings (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker    TEXT NOT NULL UNIQUE,
-            shares    REAL NOT NULL,
-            avg_cost  REAL NOT NULL,
-            notes     TEXT,
-            added_at  TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+@st.cache_resource(show_spinner=False)
+def _get_client():
+    try:
+        from supabase import create_client
+        url = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
+        key = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
+        if not url or not key:
+            return None
+        return create_client(url, key)
+    except Exception:
+        return None
 
-_init_db()
 
 def _save_holding(ticker, shares, avg_cost, notes=""):
-    conn = _get_conn()
-    conn.execute("""
-        INSERT INTO holdings (ticker, shares, avg_cost, notes, added_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(ticker) DO UPDATE SET
-            shares=excluded.shares, avg_cost=excluded.avg_cost, notes=excluded.notes
-    """, (ticker.upper(), shares, avg_cost, notes, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
-    conn.close()
+    client = _get_client()
+    if client is None:
+        st.error("⚠️ Supabase not configured — holdings cannot be saved.")
+        return
+    try:
+        client.table("holdings").upsert({
+            "ticker":   ticker.upper(),
+            "shares":   shares,
+            "avg_cost": avg_cost,
+            "notes":    notes or "",
+            "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }, on_conflict="ticker").execute()
+    except Exception as e:
+        st.error(f"Could not save holding: {str(e)[:100]}")
+
 
 def _delete_holding(ticker):
-    conn = _get_conn()
-    conn.execute("DELETE FROM holdings WHERE ticker=?", (ticker.upper(),))
-    conn.commit()
-    conn.close()
+    client = _get_client()
+    if client is None:
+        return
+    try:
+        client.table("holdings").delete().eq("ticker", ticker.upper()).execute()
+    except Exception as e:
+        st.error(f"Could not delete holding: {str(e)[:100]}")
+
 
 def _load_holdings():
+    client = _get_client()
+    if client is None:
+        return pd.DataFrame()
     try:
-        conn = _get_conn()
-        df   = pd.read_sql_query("SELECT * FROM holdings ORDER BY ticker", conn)
-        conn.close()
-        return df
+        resp = client.table("holdings").select("*").order("ticker").execute()
+        rows = resp.data if resp.data else []
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
+
+
+def get_holding_count() -> int:
+    """Fast count for Command Center status strip."""
+    client = _get_client()
+    if client is None:
+        return 0
+    try:
+        resp = client.table("holdings").select("id", count="exact").execute()
+        return resp.count or 0
+    except Exception:
+        return 0
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _fetch_full_data(tickers: tuple) -> dict:

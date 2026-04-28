@@ -591,21 +591,16 @@ with tab_home:
     s1, s2, s3, s4 = st.columns(4)
     live_running = st.session_state.get("live_running", False)
     sig_count    = len(st.session_state.get("processed_signals", []))
-    port_count   = 0
+
+    # Use Supabase count functions (gracefully returns 0 if not configured)
     try:
-        import sqlite3
-        conn = sqlite3.connect(str(APP_DIR / "portfolio.db"), check_same_thread=False)
-        port_count = conn.execute("SELECT COUNT(*) FROM holdings").fetchone()[0]
-        conn.close()
+        from modules.signal_history   import get_signal_count
+        from modules.portfolio_tracker import get_holding_count
+        sig_hist   = get_signal_count()
+        port_count = get_holding_count()
     except Exception:
-        pass
-    sig_hist = 0
-    try:
-        conn2 = sqlite3.connect(str(APP_DIR / "signal_history.db"), check_same_thread=False)
-        sig_hist = conn2.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-        conn2.close()
-    except Exception:
-        pass
+        sig_hist   = 0
+        port_count = 0
 
     with s1:
         dot    = '<span class="dot-live"></span>' if live_running else '<span class="dot-idle"></span>'

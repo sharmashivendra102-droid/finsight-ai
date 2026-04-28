@@ -16,3 +16,4 @@ feedparser>=6.0.10
 streamlit-autorefresh>=1.0.1
 scipy>=1.12.0
 sendgrid>=6.11.0
+supabase>=2.0.0

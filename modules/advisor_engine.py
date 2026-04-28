@@ -69,7 +69,8 @@ def _build_context(corr_df, sentiment_df, roll_df, valid_tickers) -> str:
 
 
 def _call_groq_advisor(context: str, user_question: str, api_key: str, conversation_history: list) -> str:
-    from groq import Groq
+    import time
+    from groq import Groq, RateLimitError, APIStatusError, APIConnectionError
 
     system_prompt = """You are FinSight AI, an expert financial advisor and quantitative analyst. 
 You have deep knowledge of portfolio theory, market correlations, technical analysis, and behavioral finance.
@@ -102,14 +103,12 @@ Format your advice with these sections when relevant:
 
     messages = [{"role": "system", "content": system_prompt}]
 
-    # Inject data context as first user message if this is a fresh conversation
     if not conversation_history:
         messages.append({
             "role": "user",
             "content": f"Here is the current market data for my portfolio:\n\n{context}\n\nBased on this data, {user_question}"
         })
     else:
-        # Rebuild full history, prepend context to very first user message
         for i, msg in enumerate(conversation_history):
             if i == 0 and msg["role"] == "user":
                 messages.append({
@@ -121,16 +120,56 @@ Format your advice with these sections when relevant:
         messages.append({"role": "user", "content": user_question})
 
     client = Groq(api_key=api_key)
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            temperature=0.4,
-            max_tokens=2000,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"❌ Error calling AI advisor: {str(e)}"
+    wait = 8
+
+    for attempt in range(1, 4):
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.4,
+                max_tokens=2000,
+            )
+            return response.choices[0].message.content.strip()
+
+        except RateLimitError:
+            if attempt < 3:
+                st.toast(f"⏳ Advisor engine busy — retrying in {wait}s ({attempt}/3)", icon="⚡")
+                time.sleep(wait)
+                wait *= 2
+            else:
+                return (
+                    "⚡ **Rate limit reached.** The advisor is handling too many requests right now. "
+                    "Wait 60 seconds and ask your question again."
+                )
+
+        except APIConnectionError:
+            if attempt < 3:
+                st.toast(f"📡 Connection issue — retrying ({attempt}/3)…")
+                time.sleep(4)
+            else:
+                return "📡 **Could not connect to the advisor engine.** Check your internet connection and try again."
+
+        except APIStatusError as e:
+            code = getattr(e, "status_code", "?")
+            if code == 503 and attempt < 3:
+                st.toast(f"🔄 Advisor temporarily unavailable — retrying ({attempt}/3)…")
+                time.sleep(10)
+            elif code == 401:
+                return "🔴 **Invalid API key.** Check your `GROQ_API_KEY` in Streamlit Secrets."
+            else:
+                if attempt < 3:
+                    time.sleep(wait); wait *= 2
+                else:
+                    return f"🔴 **Advisor engine error (HTTP {code})** — {str(e)[:120]}"
+
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(wait); wait *= 2
+            else:
+                return f"❌ Advisor error: {str(e)[:150]}"
+
+    return "⚠️ The advisor could not generate a response. Please try again."
 
 
 def run_advisor(groq_api_key: str):

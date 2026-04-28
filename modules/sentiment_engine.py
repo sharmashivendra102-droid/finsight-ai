@@ -78,10 +78,11 @@ def _score_with_groq(text: str, url: str, api_key: str) -> dict:
     Returns dict with keys: political_bias, truthfulness, propaganda, hype, panic
     All values clamped 0-1.
     """
-    from groq import Groq
+    import time
+    from groq import Groq, RateLimitError, APIStatusError, APIConnectionError
 
-    # Truncate text to keep prompt within token limits
-    snippet = text[:3500]
+    snippet  = text[:3500]
+    defaults = {k: 0.5 for k in ["political_bias", "truthfulness", "propaganda", "hype", "panic"]}
 
     prompt = f"""You are a financial journalism analyst. Analyze the following news article excerpt and return ONLY a JSON object with these exact keys and float values between 0 and 1:
 - political_bias: 0 = no bias, 1 = extreme political bias
@@ -101,44 +102,80 @@ Respond with ONLY the JSON object. No markdown, no explanation, no backticks. Ex
 {{"political_bias": 0.2, "truthfulness": 0.8, "propaganda": 0.1, "hype": 0.3, "panic": 0.1}}"""
 
     client = Groq(api_key=api_key)
+    messages = [{"role": "user", "content": prompt}]
+    wait = 8
 
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=200,
-        )
-        raw = response.choices[0].message.content.strip()
+    for attempt in range(1, 4):
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.1,
+                max_tokens=200,
+            )
+            raw = response.choices[0].message.content.strip()
+            raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+            match = re.search(r'\{.*?\}', raw, re.DOTALL)
+            if match:
+                raw = match.group(0)
+            scores = json.loads(raw)
+            required_keys = ["political_bias", "truthfulness", "propaganda", "hype", "panic"]
+            result = {}
+            for k in required_keys:
+                val = scores.get(k, 0.5)
+                try:
+                    result[k] = float(max(0.0, min(1.0, val)))
+                except (TypeError, ValueError):
+                    result[k] = 0.5
+            return result
 
-        # Strip markdown fences if present
-        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+        except RateLimitError:
+            if attempt < 3:
+                st.toast(f"⏳ Sentiment engine busy — retrying in {wait}s ({attempt}/3)", icon="⚡")
+                time.sleep(wait)
+                wait *= 2
+            else:
+                st.warning(
+                    "⚡ **Rate limit reached during sentiment scoring.** "
+                    "Using neutral scores for this article. Wait 60 seconds and re-run."
+                )
+                return defaults
 
-        # Extract JSON object
-        match = re.search(r'\{.*?\}', raw, re.DOTALL)
-        if match:
-            raw = match.group(0)
+        except APIConnectionError:
+            if attempt < 3:
+                st.toast(f"📡 Connection issue — retrying ({attempt}/3)…")
+                time.sleep(4)
+            else:
+                st.warning("📡 **Connection error during sentiment scoring.** Using neutral defaults.")
+                return defaults
 
-        scores = json.loads(raw)
+        except APIStatusError as e:
+            code = getattr(e, "status_code", "?")
+            if code == 503 and attempt < 3:
+                st.toast(f"🔄 Engine unavailable — retrying ({attempt}/3)…")
+                time.sleep(10)
+            elif code == 401:
+                st.error("🔴 **Invalid API key.** Check your `GROQ_API_KEY` in Streamlit Secrets.")
+                return defaults
+            else:
+                if attempt < 3:
+                    time.sleep(wait); wait *= 2
+                else:
+                    st.warning(f"⚠️ Sentiment engine error (HTTP {code}) — using neutral defaults.")
+                    return defaults
 
-        # Validate and clamp
-        required_keys = ["political_bias", "truthfulness", "propaganda", "hype", "panic"]
-        result = {}
-        for k in required_keys:
-            val = scores.get(k, 0.5)
-            try:
-                result[k] = float(max(0.0, min(1.0, val)))
-            except (TypeError, ValueError):
-                result[k] = 0.5
+        except json.JSONDecodeError:
+            st.warning("⚠️ Sentiment scorer returned malformed JSON — using neutral defaults.")
+            return defaults
 
-        return result
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(wait); wait *= 2
+            else:
+                st.warning(f"⚠️ Sentiment scoring error: {str(e)[:120]}")
+                return defaults
 
-    except json.JSONDecodeError:
-        st.warning(f"⚠️ LLM returned malformed JSON for one article; using neutral defaults.")
-        return {k: 0.5 for k in ["political_bias", "truthfulness", "propaganda", "hype", "panic"]}
-    except Exception as e:
-        st.warning(f"⚠️ Groq API error: {str(e)[:120]}")
-        return {k: 0.5 for k in ["political_bias", "truthfulness", "propaganda", "hype", "panic"]}
+    return defaults
 
 
 def run_sentiment_analysis(urls: list, groq_api_key: str):
