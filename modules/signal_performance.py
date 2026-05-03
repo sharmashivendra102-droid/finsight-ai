@@ -66,25 +66,20 @@ def _fetch_ohlc(ticker: str, entry_date: str, exit_date: str,
 
 def _load_signals(days_back, src_filter=None, act_filter=None):
     try:
-        conn   = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        cutoff = (datetime.now()-timedelta(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
-        df = pd.read_sql_query(
-            "SELECT * FROM signals WHERE timestamp>=? AND action IN ('BUY','SHORT') ORDER BY timestamp",
-            conn, params=(cutoff,))
-        conn.close()
+        from modules.signal_history import get_signals_df
+        return get_signals_df(
+            days_back=days_back,
+            source_filter=src_filter,
+            action_filter=act_filter or ["BUY", "SHORT"],
+        )
     except Exception:
         return pd.DataFrame()
-    if src_filter: df = df[df["source"].isin(src_filter)]
-    if act_filter: df = df[df["action"].isin(act_filter)]
-    return df
 
 
 def _load_full():
     try:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        df   = pd.read_sql_query("SELECT * FROM signals WHERE action IN ('BUY','SHORT') ORDER BY timestamp", conn)
-        conn.close()
-        return df
+        from modules.signal_history import get_signals_df
+        return get_signals_df(days_back=365, action_filter=["BUY", "SHORT"])
     except Exception:
         return pd.DataFrame()
 

@@ -242,34 +242,25 @@ def _compute_significance(returns: pd.Series) -> dict:
 
 
 def _save_simulated_signals(df: pd.DataFrame):
-    """Save simulated signals to signal_history.db so Performance tab can evaluate them."""
+    """Save simulated signals to Supabase so Performance tab can evaluate them."""
     if df.empty:
         return
     try:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        from modules.signal_history import log_signal
         for _, row in df.iterrows():
-            conn.execute("""
-                INSERT OR IGNORE INTO signals
-                (timestamp, source, ticker, action, confidence, urgency,
-                 market_impact, time_horizon, reasoning, article_title,
-                 article_url, source_feed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                row["date"] + " 09:30:00",
-                "auto_evaluator",
-                row["ticker"],
-                row["action"],
-                "MEDIUM",
-                "MEDIUM",
-                "BULLISH" if row["action"] == "BUY" else "BEARISH",
-                "SWING (1-5 days)",
-                f"Simulated {row['strategy']} signal",
-                f"Auto-eval: {row['strategy']}",
-                "",
-                "historical_simulation",
-            ))
-        conn.commit()
-        conn.close()
+            log_signal(
+                source        = "auto_evaluator",
+                ticker        = row["ticker"],
+                action        = row["action"],
+                confidence    = "MEDIUM",
+                urgency       = "MEDIUM",
+                market_impact = "BULLISH" if row["action"] == "BUY" else "BEARISH",
+                time_horizon  = "SWING (1-5 days)",
+                reasoning     = f"Simulated {row['strategy']} signal",
+                article_title = f"Auto-eval: {row['strategy']}",
+                article_url   = "",
+                source_feed   = "historical_simulation",
+            )
     except Exception:
         pass
 

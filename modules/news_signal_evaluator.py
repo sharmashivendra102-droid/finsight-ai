@@ -76,15 +76,12 @@ def _fetch_price(ticker: str, date_str: str) -> float | None:
 
 def _load_news_signals() -> pd.DataFrame:
     try:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        df   = pd.read_sql_query("""
-            SELECT * FROM signals
-            WHERE source IN ('live_intelligence','ticker_signals','market_briefing')
-            AND action IN ('BUY','SHORT')
-            ORDER BY timestamp
-        """, conn)
-        conn.close()
-        return df
+        from modules.signal_history import get_signals_df
+        return get_signals_df(
+            days_back=365,
+            source_filter=["live_intelligence", "ticker_signals", "market_briefing"],
+            action_filter=["BUY", "SHORT"],
+        )
     except Exception:
         return pd.DataFrame()
 
@@ -92,13 +89,8 @@ def _load_news_signals() -> pd.DataFrame:
 def _load_all_ticker_signals() -> pd.DataFrame:
     """Load ALL signals (all sources) for the supersession timeline."""
     try:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        df   = pd.read_sql_query(
-            "SELECT * FROM signals WHERE action IN ('BUY','SHORT') ORDER BY timestamp",
-            conn
-        )
-        conn.close()
-        return df
+        from modules.signal_history import get_signals_df
+        return get_signals_df(days_back=365, action_filter=["BUY", "SHORT"])
     except Exception:
         return pd.DataFrame()
 

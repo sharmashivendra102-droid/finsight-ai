@@ -117,8 +117,7 @@ def _fetch_overnight_news() -> list:
 
 
 def _generate_summary_with_groq(articles, market_data, api_key, watchlist):
-    import time
-    from groq import Groq, RateLimitError, APIStatusError, APIConnectionError
+    from groq import Groq
 
     market_lines = []
     for name, symbol in MARKET_INDICATORS.items():
@@ -226,71 +225,22 @@ Rules:
 - Return ONLY valid JSON, no markdown, no backticks"""
 
     client = Groq(api_key=api_key)
-    messages = [{"role": "user", "content": prompt}]
-    wait = 8
-
-    for attempt in range(1, 4):
-        try:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.3,
-                max_tokens=3000,
-            )
-            raw = response.choices[0].message.content.strip()
-            raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
-            match = re.search(r'\{.*\}', raw, re.DOTALL)
-            if match:
-                raw = match.group(0)
-            return json.loads(raw)
-
-        except RateLimitError:
-            if attempt < 3:
-                st.toast(f"⏳ Briefing engine busy — retrying in {wait}s ({attempt}/3)", icon="⚡")
-                time.sleep(wait)
-                wait *= 2
-            else:
-                st.warning(
-                    "⚡ **Rate limit reached.** The briefing engine is overloaded. "
-                    "Wait 60 seconds and click Generate again."
-                )
-                return {}
-
-        except APIConnectionError:
-            if attempt < 3:
-                st.toast(f"📡 Connection issue — retrying ({attempt}/3)…")
-                time.sleep(4)
-            else:
-                st.error("📡 **Could not connect to the analysis engine.** Check your internet connection.")
-                return {}
-
-        except APIStatusError as e:
-            code = getattr(e, "status_code", "?")
-            if code == 503 and attempt < 3:
-                st.toast(f"🔄 Engine temporarily unavailable — retrying ({attempt}/3)…")
-                time.sleep(10)
-            elif code == 401:
-                st.error("🔴 **Invalid API key.** Check your `GROQ_API_KEY` in Streamlit Secrets.")
-                return {}
-            else:
-                if attempt < 3:
-                    time.sleep(wait); wait *= 2
-                else:
-                    st.error(f"🔴 **Morning Briefing engine error (HTTP {code})** — {str(e)[:120]}")
-                    return {}
-
-        except json.JSONDecodeError:
-            st.warning("⚠️ Briefing received a malformed response — try generating again.")
-            return {}
-
-        except Exception as e:
-            if attempt < 3:
-                time.sleep(wait); wait *= 2
-            else:
-                st.error(f"❌ Briefing error: {str(e)[:150]}")
-                return {}
-
-    return {}
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=3000,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+        return json.loads(raw)
+    except Exception as e:
+        st.error(f"❌ Groq error: {str(e)[:150]}")
+        return {}
 
 
 def _render_indicator(name, symbol, data):
@@ -387,6 +337,31 @@ def run_market_summary(api_key: str):
     st.session_state["market_summary_market_data"] = market_data
     st.session_state["market_summary_articles"]    = articles
     st.session_state["market_summary_time"]        = datetime.now().strftime("%H:%M")
+
+    # ── Log tickers_to_watch + watchlist_signals to Supabase ─────────────
+    try:
+        from modules.signal_history import log_signals_from_briefing
+        all_signals = []
+        for tw in summary.get("tickers_to_watch", []):
+            all_signals.append({
+                "ticker":     tw.get("ticker", ""),
+                "action":     tw.get("action", "WATCH"),
+                "confidence": tw.get("confidence", "LOW"),
+                "reasoning":  tw.get("reasoning", ""),
+                "catalyst":   tw.get("catalyst", ""),
+            })
+        for ws in summary.get("watchlist_signals", []):
+            all_signals.append({
+                "ticker":     ws.get("ticker", ""),
+                "action":     ws.get("signal", "WATCH"),
+                "confidence": ws.get("confidence", "LOW"),
+                "reasoning":  ws.get("notes", ""),
+                "catalyst":   "Morning Briefing watchlist signal",
+            })
+        if all_signals:
+            log_signals_from_briefing(all_signals)
+    except Exception:
+        pass
 
     _display_summary(summary, market_data, articles)
 

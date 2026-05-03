@@ -123,16 +123,10 @@ def _categorise_source(source: str, time_horizon: str) -> str:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _load_evaluated_signals() -> pd.DataFrame:
-    """Load all signals that have been evaluated (have return_pct)."""
+    """Load all signals from Supabase."""
     try:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        df   = pd.read_sql_query("""
-            SELECT * FROM signals
-            WHERE action IN ('BUY','SHORT')
-            ORDER BY timestamp
-        """, conn)
-        conn.close()
-        return df
+        from modules.signal_history import get_signals_df
+        return get_signals_df(days_back=365, action_filter=["BUY", "SHORT"])
     except Exception:
         return pd.DataFrame()
 
