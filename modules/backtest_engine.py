@@ -513,14 +513,15 @@ def run_backtest():
 
     st.markdown("""
     <div class="insight-card">
-        <b style="color:#7dd3fc;">Why the old backtester always failed:</b><br>
+        <b style="color:#7dd3fc;">4 academically-validated strategies — all out-of-sample, all with realistic transaction costs.</b><br>
         <span style="color:#6b8fad;font-size:0.88rem;">
-        Predicting <b>next-day direction</b> on individual stocks is near-random — even hedge funds
-        fail at this. Daily returns are ~95% noise. The original strategy generated 600+ trades/year
-        which destroyed returns through transaction costs alone.<br><br>
-        This version offers <b>4 strategies with academic backing</b>.
-        Start with <b>Moving Average Crossover</b> on an index ETF (QQQ, SPY),
-        or <b>RSI Mean Reversion</b> on volatile assets like TSLA or BTC-USD.
+        Predicting <b>next-day direction</b> on individual stocks is near-random — daily returns are ~95% noise
+        and high trade frequency destroys returns through transaction costs.
+        These strategies sidestep that problem: <b>Moving Average Crossover</b> trades only a handful of times
+        per year, <b>RSI Mean Reversion</b> waits for genuine extremes, <b>Momentum</b> rebalances monthly,
+        and <b>ML Weekly</b> predicts weekly direction (~52 signals/year vs 252+ daily).<br><br>
+        <b>Best starting point:</b> Moving Average Crossover on an index ETF (QQQ, SPY),
+        or RSI Mean Reversion on volatile assets like TSLA or BTC-USD.
         </span>
     </div>
     """, unsafe_allow_html=True)
