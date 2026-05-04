@@ -515,11 +515,9 @@ def run_backtest():
     <div class="insight-card">
         <b style="color:#7dd3fc;">4 academically-validated strategies — all out-of-sample, all with realistic transaction costs.</b><br>
         <span style="color:#6b8fad;font-size:0.88rem;">
-        Predicting <b>next-day direction</b> on individual stocks is near-random — daily returns are ~95% noise
-        and high trade frequency destroys returns through transaction costs.
-        These strategies sidestep that problem: <b>Moving Average Crossover</b> trades only a handful of times
-        per year, <b>RSI Mean Reversion</b> waits for genuine extremes, <b>Momentum</b> rebalances monthly,
-        and <b>ML Weekly</b> predicts weekly direction (~52 signals/year vs 252+ daily).<br><br>
+        <b>Moving Average Crossover</b> trades only a handful of times per year,
+        <b>RSI Mean Reversion</b> waits for genuine extremes, <b>Momentum</b> rebalances monthly,
+        and <b>ML Weekly</b> predicts weekly direction (~52 signals/year).<br><br>
         <b>Best starting point:</b> Moving Average Crossover on an index ETF (QQQ, SPY),
         or RSI Mean Reversion on volatile assets like TSLA or BTC-USD.
         </span>
