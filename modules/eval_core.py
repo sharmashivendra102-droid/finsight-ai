@@ -4,8 +4,12 @@ eval_core.py — Shared evaluation logic
 
 Fixes applied:
   1. Trading days not calendar days — INTRADAY = 1 trading day, SWING = 5 trading days
-  2. Signal time awareness — if signal came after market close (4pm ET), 
-     day 1 starts from NEXT trading day open
+  2. Next-trading-day entry — entry price is ALWAYS the close of the first
+     trading day AFTER the signal date, regardless of what time the signal
+     arrived.  A signal at 3 pm Friday → entry = Monday close.  A signal at
+     9 am Monday → entry = Tuesday close.  This is the only realistic model:
+     by the time a news signal is fetched, Groq-analysed, and a trader acts,
+     same-day execution at the exact signal timestamp is not reliable.
   3. Black swan detection — if a volatility spike (VIX >20% move OR stock 
      moves >3x its normal daily range) occurs during the window, the signal 
      is flagged as "inconclusive — external shock" and excluded from accuracy 
@@ -63,15 +67,15 @@ def horizon_label(td: int) -> str:
 
 def _is_after_market_close(ts: pd.Timestamp) -> bool:
     """
-    Check if the signal was generated after 4pm ET.
-    Timestamps stored without timezone — assume they are local machine time.
-    Rough check: if hour >= 16 (4pm) or hour <= 3 (before 3am = after midnight ET)
-    treat as post-close.
+    Check if the signal was generated at or after 4 pm ET (US market close).
+    Timestamps are stored in local machine time without timezone info.
+    We use 16:00 (4 pm) as the cutoff.
+
+    NOTE: in practice this function is no longer the gating condition —
+    evaluate_signals() always uses the NEXT trading day as entry,
+    regardless of signal time.  It is kept here for reference / logging.
     """
-    # Simple heuristic: if generated after 20:00 local or before 06:30 local
-    # (i.e. outside normal trading hours), start counting from next trading day
-    h = ts.hour
-    return h >= 20 or h < 6   # rough after-hours detection
+    return ts.hour >= 16
 
 
 def _add_trading_days(start_ts: pd.Timestamp, n_trading_days: int,
@@ -241,37 +245,72 @@ def evaluate_signals(
         if progress_callback:
             progress_callback(i, total, row["ticker"], row["timestamp"][:10])
 
-        sig_ts     = pd.to_datetime(row["timestamp"])
-        h_td       = get_horizon_trading_days(row.get("time_horizon", ""))
-        td_elapsed = _trading_days_elapsed(sig_ts, trading_dates)
+        sig_ts = pd.to_datetime(row["timestamp"])
+        h_td   = get_horizon_trading_days(row.get("time_horizon", ""))
+
+        # ── Determine entry date — always NEXT trading day after signal ────
+        # Rationale: regardless of what time the signal arrived (3 pm, 9 am,
+        # midnight), same-day execution at the signal timestamp is not
+        # realistic.  A 3 pm Friday signal → entry = Monday close.
+        next_tds = trading_dates[trading_dates.date > sig_ts.date()]
+        if len(next_tds) == 0:
+            # No trading day found after signal — too recent
+            base_early = {
+                "timestamp":    row["timestamp"],
+                "date":         row["timestamp"][:10],
+                "ticker":       row["ticker"],
+                "action":       row["action"],
+                "confidence":   row.get("confidence", ""),
+                "source":       row.get("source", ""),
+                "time_horizon": row.get("time_horizon", ""),
+                "horizon_td":   h_td,
+                "td_elapsed":   0,
+                "reasoning":    str(row.get("reasoning", ""))[:100],
+                "article":      str(row.get("article_title", ""))[:70],
+                "urgency":      row.get("urgency", ""),
+                "not_ready_reason": "No trading day found after signal date",
+            }
+            waiting.append(base_early)
+            continue
+
+        entry_ts       = pd.Timestamp(next_tds[0])          # e.g. Monday for Friday signal
+        entry_date_str = entry_ts.strftime("%Y-%m-%d")
+
+        # Readiness: have h_td trading days elapsed since entry_ts?
+        td_elapsed_entry = _trading_days_elapsed(entry_ts, trading_dates)
+        # Also track elapsed from signal date for display
+        td_elapsed_signal = _trading_days_elapsed(sig_ts, trading_dates)
 
         base = {
             "timestamp":    row["timestamp"],
             "date":         row["timestamp"][:10],
+            "entry_date":   entry_date_str,
             "ticker":       row["ticker"],
             "action":       row["action"],
             "confidence":   row.get("confidence", ""),
             "source":       row.get("source", ""),
             "time_horizon": row.get("time_horizon", ""),
             "horizon_td":   h_td,
-            "td_elapsed":   td_elapsed,
+            "td_elapsed":   td_elapsed_entry,   # days elapsed from entry
+            "days_elapsed": td_elapsed_signal,  # days elapsed from signal (display)
             "reasoning":    str(row.get("reasoning", ""))[:100],
             "article":      str(row.get("article_title", ""))[:70],
             "urgency":      row.get("urgency", ""),
         }
 
-        # ── Not enough TRADING days have passed ────────────────────────────
-        if td_elapsed < h_td:
-            remaining = h_td - td_elapsed
+        # ── Not enough TRADING days have passed since entry ────────────────
+        if td_elapsed_entry < h_td:
+            remaining = h_td - td_elapsed_entry
             base["not_ready_reason"] = (
                 f"Wait {remaining} more trading day{'s' if remaining != 1 else ''} "
-                f"({h_td} trading days needed, {td_elapsed} elapsed)"
+                f"(entry {entry_date_str}, {h_td} trading days needed, "
+                f"{td_elapsed_entry} elapsed from entry)"
             )
             waiting.append(base)
             continue
 
-        # ── Find planned exit date in trading days ─────────────────────────
-        planned_exit_ts = _add_trading_days(sig_ts, h_td, trading_dates)
+        # ── Find planned exit date (h_td trading days after ENTRY) ────────
+        planned_exit_ts = _add_trading_days(entry_ts, h_td, trading_dates)
         if planned_exit_ts is None:
             base["not_ready_reason"] = "Not enough trading day history to compute exit"
             waiting.append(base)
@@ -286,10 +325,10 @@ def evaluate_signals(
             ticker_timeline = ticker_timeline,
         )
 
-        # ── Fetch prices ───────────────────────────────────────────────────
-        entry_price = fetch_price_fn(row["ticker"], row["timestamp"][:10])
+        # ── Fetch prices — entry = next trading day close ──────────────────
+        entry_price = fetch_price_fn(row["ticker"], entry_date_str)
         if entry_price is None or entry_price <= 0:
-            base["not_ready_reason"] = "Entry price unavailable"
+            base["not_ready_reason"] = f"Entry price unavailable for {entry_date_str}"
             waiting.append(base)
             continue
 
@@ -300,12 +339,12 @@ def evaluate_signals(
             waiting.append(base)
             continue
 
-        # ── Black swan detection ───────────────────────────────────────────
+        # ── Black swan detection (over entry→exit window) ──────────────────
         spike = {"spiked": False, "reason": ""}
         if fetch_ohlc_fn is not None:
             spike = _detect_volatility_spike(
                 row["ticker"],
-                row["timestamp"][:10],
+                entry_date_str,   # start from actual entry, not signal date
                 exit_date_str,
                 fetch_ohlc_fn
             )
@@ -314,11 +353,12 @@ def evaluate_signals(
         raw_ret = (exit_price - entry_price) / entry_price * 100
         pnl_ret = raw_ret if row["action"] == "BUY" else -raw_ret
         correct = int(pnl_ret > 0)
-        held_td = _trading_days_elapsed(sig_ts,
+        held_td = _trading_days_elapsed(entry_ts,
                       trading_dates[trading_dates <= actual_exit_ts])
 
         result = {
             **base,
+            "entry_date":   entry_date_str,
             "entry_price":  round(entry_price, 2),
             "exit_price":   round(exit_price, 2),
             "exit_date":    exit_date_str,
