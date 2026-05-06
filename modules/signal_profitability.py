@@ -123,10 +123,16 @@ def _categorise_source(source: str, time_horizon: str) -> str:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _load_evaluated_signals() -> pd.DataFrame:
-    """Load all signals from Supabase."""
+    """Load all signals that have been evaluated (have return_pct)."""
     try:
-        from modules.signal_history import get_signals_df
-        return get_signals_df(days_back=365, action_filter=["BUY", "SHORT"])
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        df   = pd.read_sql_query("""
+            SELECT * FROM signals
+            WHERE action IN ('BUY','SHORT')
+            ORDER BY timestamp
+        """, conn)
+        conn.close()
+        return df
     except Exception:
         return pd.DataFrame()
 
@@ -157,10 +163,21 @@ def _enrich_with_outcomes(df_raw: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             return None
 
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _fetch_ohlc_spe(ticker: str, entry_date: str, exit_date: str, lookback_days: int = 60):
+        try:
+            start = (pd.to_datetime(entry_date) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+            end   = (pd.to_datetime(exit_date)  + timedelta(days=3)).strftime("%Y-%m-%d")
+            hist  = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
+            hist.index = pd.to_datetime(hist.index).tz_localize(None)
+            return hist if not hist.empty else None
+        except Exception:
+            return None
+
     ready_df, _, _ = evaluate_signals(
         df                       = df_raw,
         fetch_price_fn           = _fetch_price,
-        fetch_ohlc_fn            = None,
+        fetch_ohlc_fn            = _fetch_ohlc_spe,   # enables MFE/MAE in profitability analysis
         all_signals_for_timeline = df_raw,
         progress_callback        = None,
     )

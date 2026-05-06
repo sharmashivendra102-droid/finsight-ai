@@ -45,6 +45,12 @@ VOLATILITY_MULTIPLIER_THRESHOLD = 3.0
 # Also flag if VIX moved more than this % during the window
 VIX_SPIKE_THRESHOLD_PCT = 20.0
 
+# Maximum Favorable Excursion — default threshold for "directionally correct"
+# A signal is considered directionally correct if the price moved at least
+# this many % in the signal's favour at any point during the holding window,
+# even if the final exit price was against the signal.
+MFE_DIRECTIONAL_THRESHOLD = 0.5   # 0.5 %
+
 
 def get_horizon_trading_days(horizon_str: str) -> int:
     if not horizon_str:
@@ -198,6 +204,99 @@ def _detect_volatility_spike(ticker: str, entry_date: str, exit_date: str,
         return {"spiked": False, "reason": ""}
 
 
+# ── Maximum Favorable / Adverse Excursion ─────────────────────────────────────
+
+def _compute_mfe_mae(ticker: str, entry_date_str: str, exit_date_str: str,
+                     action: str, entry_price: float,
+                     fetch_ohlc_fn) -> dict:
+    """
+    Compute Maximum Favorable Excursion (MFE) and Maximum Adverse Excursion (MAE)
+    over the signal's holding window using intraday High/Low data.
+
+    MFE answers: "How far did price move IN the signal's direction at its best?"
+    MAE answers: "How far did price move AGAINST the signal at its worst?"
+
+    For a BUY signal:
+        MFE = (peak_high  - entry) / entry * 100   (best upside reached)
+        MAE = (entry - trough_low) / entry * 100   (worst drawdown seen)
+
+    For a SHORT signal:
+        MFE = (entry - trough_low) / entry * 100   (best downside reached)
+        MAE = (peak_high - entry)  / entry * 100   (worst run-up against)
+
+    A signal is "directionally correct" if MFE > MFE_DIRECTIONAL_THRESHOLD (0.5%
+    by default).  This captures signals where the thesis was right and the price
+    DID move favourably, but then reversed before the formal exit — a pattern
+    common when fast-moving news triggers a quick spike followed by a fade.
+
+    Returns dict with keys: mfe, mae, mfe_date, mae_date, excursion_ratio.
+    All values are None when OHLC data is unavailable.
+    """
+    empty = {
+        "mfe": None, "mae": None,
+        "mfe_date": None, "mae_date": None,
+        "excursion_ratio": None,
+    }
+    if fetch_ohlc_fn is None or entry_price is None or entry_price <= 0:
+        return empty
+
+    try:
+        # We only need data inside the holding window; pass a tiny lookback
+        hist = fetch_ohlc_fn(ticker, entry_date_str, exit_date_str, lookback_days=2)
+        if hist is None or hist.empty:
+            return empty
+
+        entry_dt = pd.Timestamp(entry_date_str)
+        exit_dt  = pd.Timestamp(exit_date_str)
+
+        # Restrict to [entry, exit] inclusive
+        window = hist[
+            (hist.index >= entry_dt) &
+            (hist.index <= exit_dt + pd.Timedelta(days=1))
+        ]
+        if window.empty:
+            return empty
+
+        # Use High/Low where available; fall back to Close
+        highs = window["High"] if "High" in window.columns else window["Close"]
+        lows  = window["Low"]  if "Low"  in window.columns else window["Close"]
+
+        peak_high   = float(highs.max())
+        trough_low  = float(lows.min())
+        peak_date   = highs.idxmax().strftime("%Y-%m-%d")
+        trough_date = lows.idxmin().strftime("%Y-%m-%d")
+
+        if action.upper() == "BUY":
+            mfe      = (peak_high  - entry_price) / entry_price * 100
+            mae      = (entry_price - trough_low) / entry_price * 100
+            mfe_date = peak_date
+            mae_date = trough_date
+        else:   # SHORT
+            mfe      = (entry_price - trough_low) / entry_price * 100
+            mae      = (peak_high  - entry_price) / entry_price * 100
+            mfe_date = trough_date
+            mae_date = peak_date
+
+        mfe = max(0.0, round(mfe, 3))
+        mae = max(0.0, round(mae, 3))
+
+        # Excursion ratio: what fraction of total price range was favourable?
+        # 1.0 = all movement was in signal direction; 0.0 = entirely against.
+        total_range = mfe + mae
+        exc_ratio   = round(mfe / total_range, 3) if total_range > 0 else None
+
+        return {
+            "mfe":             mfe,
+            "mae":             mae,
+            "mfe_date":        mfe_date,
+            "mae_date":        mae_date,
+            "excursion_ratio": exc_ratio,
+        }
+
+    except Exception:
+        return empty
+
+
 # ── Main evaluation function ──────────────────────────────────────────────────
 
 def evaluate_signals(
@@ -349,6 +448,22 @@ def evaluate_signals(
                 fetch_ohlc_fn
             )
 
+        # ── Maximum Favorable / Adverse Excursion ─────────────────────────
+        # Measures whether the price ever moved in the signal's direction
+        # during the hold window, even if it reversed by exit.
+        excursion = _compute_mfe_mae(
+            ticker         = row["ticker"],
+            entry_date_str = entry_date_str,
+            exit_date_str  = exit_date_str,
+            action         = row["action"],
+            entry_price    = entry_price,
+            fetch_ohlc_fn  = fetch_ohlc_fn,
+        )
+        directional_correct = (
+            excursion["mfe"] is not None
+            and excursion["mfe"] > MFE_DIRECTIONAL_THRESHOLD
+        )
+
         # ── Compute return ─────────────────────────────────────────────────
         raw_ret = (exit_price - entry_price) / entry_price * 100
         pnl_ret = raw_ret if row["action"] == "BUY" else -raw_ret
@@ -358,18 +473,25 @@ def evaluate_signals(
 
         result = {
             **base,
-            "entry_date":   entry_date_str,
-            "entry_price":  round(entry_price, 2),
-            "exit_price":   round(exit_price, 2),
-            "exit_date":    exit_date_str,
-            "held_td":      held_td,
-            "exit_reason":  exit_reason,
-            "superseded":   exit_reason != "horizon",
-            "return_pct":   round(pnl_ret, 3),
-            "correct":      correct,
-            "outcome":      "✅ Correct" if correct else "❌ Incorrect",
-            "spike_flag":   spike["spiked"],
-            "spike_reason": spike["reason"],
+            "entry_date":          entry_date_str,
+            "entry_price":         round(entry_price, 2),
+            "exit_price":          round(exit_price, 2),
+            "exit_date":           exit_date_str,
+            "held_td":             held_td,
+            "exit_reason":         exit_reason,
+            "superseded":          exit_reason != "horizon",
+            "return_pct":          round(pnl_ret, 3),
+            "correct":             correct,
+            "outcome":             "✅ Correct" if correct else "❌ Incorrect",
+            "spike_flag":          spike["spiked"],
+            "spike_reason":        spike["reason"],
+            # ── Excursion fields ──────────────────────────────────────────
+            "mfe":                 excursion["mfe"],
+            "mae":                 excursion["mae"],
+            "mfe_date":            excursion["mfe_date"],
+            "mae_date":            excursion["mae_date"],
+            "excursion_ratio":     excursion["excursion_ratio"],
+            "directional_correct": directional_correct,
         }
 
         if spike["spiked"]:

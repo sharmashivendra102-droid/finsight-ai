@@ -66,20 +66,25 @@ def _fetch_ohlc(ticker: str, entry_date: str, exit_date: str,
 
 def _load_signals(days_back, src_filter=None, act_filter=None):
     try:
-        from modules.signal_history import get_signals_df
-        return get_signals_df(
-            days_back=days_back,
-            source_filter=src_filter,
-            action_filter=act_filter or ["BUY", "SHORT"],
-        )
+        conn   = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        cutoff = (datetime.now()-timedelta(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
+        df = pd.read_sql_query(
+            "SELECT * FROM signals WHERE timestamp>=? AND action IN ('BUY','SHORT') ORDER BY timestamp",
+            conn, params=(cutoff,))
+        conn.close()
     except Exception:
         return pd.DataFrame()
+    if src_filter: df = df[df["source"].isin(src_filter)]
+    if act_filter: df = df[df["action"].isin(act_filter)]
+    return df
 
 
 def _load_full():
     try:
-        from modules.signal_history import get_signals_df
-        return get_signals_df(days_back=365, action_filter=["BUY", "SHORT"])
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        df   = pd.read_sql_query("SELECT * FROM signals WHERE action IN ('BUY','SHORT') ORDER BY timestamp", conn)
+        conn.close()
+        return df
     except Exception:
         return pd.DataFrame()
 
@@ -148,7 +153,7 @@ def run_signal_performance():
         ready_df, waiting_df, inconclusive_df = evaluate_signals(
             df                       = df_raw,
             fetch_price_fn           = _fetch_price,
-            fetch_ohlc_fn            = _fetch_ohlc if detect_shocks else None,
+            fetch_ohlc_fn            = _fetch_ohlc,   # always on — needed for MFE/MAE + optional shock detection
             all_signals_for_timeline = df_full,
             progress_callback        = _cb,
         )
@@ -233,15 +238,95 @@ def run_signal_performance():
     rr    = abs(aw/al) if al!=0 else 0
     rr_c  = GREEN if rr>=2 else (AMBER if rr>=1 else RED)
 
+    has_mfe = "mfe" in ready_df.columns and ready_df["mfe"].notna().any()
+    mfe_threshold = st.slider(
+        "📐 MFE threshold — min % move to count as 'directionally correct'",
+        min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="sp_mfe_thresh",
+        help="If price moved this far in the signal's direction at any point, it's 'directionally correct' even if the exit was negative."
+    ) if has_mfe else 0.5
+
+    if has_mfe:
+        dir_mask  = ready_df["mfe"].notna() & (ready_df["mfe"] >= mfe_threshold)
+        dir_acc   = dir_mask.mean() * 100
+        dir_ac_c  = GREEN if dir_acc>=60 else (AMBER if dir_acc>=50 else RED)
+    else:
+        dir_acc   = None
+
     m1,m2,m3,m4,m5,m6 = st.columns(6)
-    with m1: _mb("Accuracy",    f"{acc:.1f}%",  ac)
-    with m2: _mb("Avg Win",     f"+{aw:.1f}%",  GREEN)
-    with m3: _mb("Avg Loss",    f"{al:.1f}%",   RED)
-    with m4: _mb("Win/Loss",    f"{rr:.2f}",    rr_c)
-    with m5: _mb("Evaluated",   str(total),     BLUE)
-    with m6: _mb("Excl. Shock", str(len(inconclusive_df)), AMBER)
+    with m1: _mb("Exit Accuracy",   f"{acc:.1f}%",  ac)
+    with m2: _mb("Avg Win",         f"+{aw:.1f}%",  GREEN)
+    with m3: _mb("Avg Loss",        f"{al:.1f}%",   RED)
+    with m4: _mb("Win/Loss Ratio",  f"{rr:.2f}",    rr_c)
+    with m5: _mb("Evaluated",       str(total),     BLUE)
+    with m6:
+        if dir_acc is not None:
+            _mb("Dir. Accuracy", f"{dir_acc:.1f}%", dir_ac_c)
+        else:
+            _mb("Excl. Shock", str(len(inconclusive_df)), AMBER)
 
     st.markdown("")
+
+    # ── MFE Excursion section ──────────────────────────────────────────────
+    if has_mfe:
+        st.markdown('<div class="section-header">📐 Excursion Analysis (MFE / MAE)</div>', unsafe_allow_html=True)
+        st.caption(
+            f"MFE = best favourable move during hold · MAE = worst adverse move. "
+            f"Points in the amber zone had MFE ≥ {mfe_threshold:.1f}% but ended negative — "
+            f"right direction, wrong timing."
+        )
+        exc_df = ready_df[ready_df["mfe"].notna()].copy()
+        if len(exc_df) >= 3:
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            _style_fig(fig, list(axes))
+
+            ax1 = axes[0]
+            dot_colors = [GREEN if c else RED for c in exc_df["correct"]]
+            ax1.scatter(exc_df["mfe"], exc_df["return_pct"],
+                        c=dot_colors, alpha=0.75, edgecolors=BORDER, linewidth=0.5, s=55)
+            ax1.axhline(0, color=MUTED, linewidth=0.8, linestyle="--")
+            ax1.axvline(mfe_threshold, color=AMBER, linewidth=1, linestyle=":",
+                        label=f"MFE ≥ {mfe_threshold:.1f}%")
+            ymin = exc_df["return_pct"].min()
+            ax1.fill_betweenx([ymin * 1.05, 0],
+                              mfe_threshold, exc_df["mfe"].max() * 1.1,
+                              alpha=0.05, color=AMBER)
+            ax1.text(mfe_threshold + 0.1, ymin * 0.9,
+                     "Right dir.\nwrong timing", color=AMBER, fontsize=7, alpha=0.85)
+            ax1.set_title("MFE vs Final Return %", color=CYAN, fontsize=9)
+            ax1.set_xlabel("MFE % (best move in signal direction)", color=MUTED, fontsize=8)
+            ax1.set_ylabel("Final Return %", color=MUTED, fontsize=8)
+            from matplotlib.lines import Line2D
+            ax1.legend(handles=[
+                Line2D([0],[0], marker='o', color='w', markerfacecolor=GREEN, markersize=7, label='Correct exit'),
+                Line2D([0],[0], marker='o', color='w', markerfacecolor=RED,   markersize=7, label='Incorrect exit'),
+            ], fontsize=7, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
+
+            ax2 = axes[1]
+            grps = ["Correct", "Incorrect"]
+            corr_s = exc_df[exc_df["correct"]==1]
+            incr_s = exc_df[exc_df["correct"]==0]
+            avg_mfe_v = [corr_s["mfe"].mean() if len(corr_s) else 0, incr_s["mfe"].mean() if len(incr_s) else 0]
+            avg_mae_v = [corr_s["mae"].mean() if len(corr_s) else 0, incr_s["mae"].mean() if len(incr_s) else 0]
+            x = np.arange(len(grps))
+            w = 0.35
+            ax2.bar(x - w/2, avg_mfe_v, w, color=GREEN, edgecolor=BORDER, linewidth=0.4, label="Avg MFE", alpha=0.85)
+            ax2.bar(x + w/2, avg_mae_v, w, color=RED,   edgecolor=BORDER, linewidth=0.4, label="Avg MAE", alpha=0.85)
+            ax2.set_xticks(x); ax2.set_xticklabels(grps, color=TEXT, fontsize=9)
+            ax2.set_title("Avg MFE vs MAE: Correct vs Incorrect Exits", color=CYAN, fontsize=9)
+            ax2.set_ylabel("% move", color=MUTED, fontsize=8)
+            ax2.legend(fontsize=8, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
+            fig.tight_layout(); st.pyplot(fig); plt.close(fig)
+
+            # Insight callout
+            if len(incr_s) > 0:
+                timing_victims = int((incr_s["mfe"] >= mfe_threshold).sum())
+                if timing_victims > 0:
+                    st.warning(
+                        f"⚡ **{timing_victims} of {len(incr_s)} 'incorrect' signals ({timing_victims/len(incr_s)*100:.0f}%) "
+                        f"were directionally right** — price moved ≥{mfe_threshold:.1f}% favourably but reversed before exit. "
+                        f"True directional accuracy: **{dir_acc:.1f}%** vs exit accuracy **{acc:.1f}%**."
+                    )
+
 
     # ── Normal vs early-exit comparison ───────────────────────────────────
     if "superseded" in ready_df.columns and sup_count > 0:
@@ -354,25 +439,33 @@ def run_signal_performance():
 
     # ── Full table ─────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">📋 All Evaluated Signals</div>', unsafe_allow_html=True)
-    disp_cols = ["date","ticker","action","confidence","time_horizon","held_td",
-                 "entry_price","exit_price","return_pct","outcome","superseded","source"]
+    disp_cols = ["date","entry_date","ticker","action","confidence","time_horizon","held_td",
+                 "entry_price","exit_price","return_pct","mfe","mae","excursion_ratio",
+                 "directional_correct","outcome","superseded","source"]
     disp = ready_df[[c for c in disp_cols if c in ready_df.columns]].copy()
     def c_a(v): return f"color:{GREEN}" if v=="BUY" else f"color:{RED}"
     def c_o(v): return f"color:{GREEN}" if "Correct" in str(v) else f"color:{RED}"
     def c_r(v):
         if pd.isna(v): return ""
         return f"color:{GREEN}" if v>0 else f"color:{RED}"
+    def c_dc(v): return f"color:{GREEN}" if v else f"color:{MUTED}"
     sty = disp.style
-    if "action"    in disp.columns: sty = sty.map(c_a, subset=["action"])
-    if "outcome"   in disp.columns: sty = sty.map(c_o, subset=["outcome"])
-    if "return_pct"in disp.columns: sty = sty.map(c_r, subset=["return_pct"])
+    if "action"             in disp.columns: sty = sty.map(c_a,  subset=["action"])
+    if "outcome"            in disp.columns: sty = sty.map(c_o,  subset=["outcome"])
+    if "return_pct"         in disp.columns: sty = sty.map(c_r,  subset=["return_pct"])
+    if "mfe"                in disp.columns: sty = sty.map(c_r,  subset=["mfe"])
+    if "directional_correct" in disp.columns: sty = sty.map(c_dc, subset=["directional_correct"])
     sty = sty.format({
-        "entry_price": "${:.2f}", "exit_price": "${:.2f}",
-        "return_pct":  lambda x: f"{x:+.2f}%" if pd.notna(x) else "—",
+        "entry_price":     "${:.2f}",
+        "exit_price":      "${:.2f}",
+        "return_pct":      lambda x: f"{x:+.2f}%" if pd.notna(x) else "—",
+        "mfe":             lambda x: f"+{x:.2f}%" if pd.notna(x) else "—",
+        "mae":             lambda x: f"-{x:.2f}%" if pd.notna(x) else "—",
+        "excursion_ratio": lambda x: f"{x:.2f}"   if pd.notna(x) else "—",
     })
     st.dataframe(sty, use_container_width=True, hide_index=True)
 
     csv = ready_df.to_csv(index=False)
-    st.download_button("⬇️ Download as CSV", data=csv,
+    st.download_button("⬇️ Download as CSV (includes MFE/MAE)", data=csv,
                        file_name=f"signal_performance_{datetime.now().strftime('%Y%m%d')}.csv",
                        mime="text/csv")

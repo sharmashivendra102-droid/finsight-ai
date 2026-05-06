@@ -76,12 +76,15 @@ def _fetch_price(ticker: str, date_str: str) -> float | None:
 
 def _load_news_signals() -> pd.DataFrame:
     try:
-        from modules.signal_history import get_signals_df
-        return get_signals_df(
-            days_back=365,
-            source_filter=["live_intelligence", "ticker_signals", "market_briefing"],
-            action_filter=["BUY", "SHORT"],
-        )
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        df   = pd.read_sql_query("""
+            SELECT * FROM signals
+            WHERE source IN ('live_intelligence','ticker_signals','market_briefing')
+            AND action IN ('BUY','SHORT')
+            ORDER BY timestamp
+        """, conn)
+        conn.close()
+        return df
     except Exception:
         return pd.DataFrame()
 
@@ -89,8 +92,13 @@ def _load_news_signals() -> pd.DataFrame:
 def _load_all_ticker_signals() -> pd.DataFrame:
     """Load ALL signals (all sources) for the supersession timeline."""
     try:
-        from modules.signal_history import get_signals_df
-        return get_signals_df(days_back=365, action_filter=["BUY", "SHORT"])
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        df   = pd.read_sql_query(
+            "SELECT * FROM signals WHERE action IN ('BUY','SHORT') ORDER BY timestamp",
+            conn
+        )
+        conn.close()
+        return df
     except Exception:
         return pd.DataFrame()
 
@@ -192,7 +200,7 @@ def run_news_signal_evaluator():
         ready_df, waiting_df, inconclusive_df = evaluate_signals(
             df                       = filtered,
             fetch_price_fn           = _fetch_price,
-            fetch_ohlc_fn            = _fetch_ohlc if detect_shocks else None,
+            fetch_ohlc_fn            = _fetch_ohlc,   # always on — needed for MFE/MAE + optional shock detection
             all_signals_for_timeline = df_full,
             progress_callback        = _cb,
         )
@@ -243,18 +251,189 @@ def run_news_signal_evaluator():
     ac_c  = _ac(acc)
     label = "Strong Edge 🟢" if acc>=60 else ("Marginal 🟡" if acc>=50 else "Below Random 🔴")
 
-    st.markdown(f"""
-    <div style="background:linear-gradient(135deg,#0d1b2a,#0f2035);
-                border:2px solid {ac_c}44;border-radius:16px;
-                padding:1.4rem 2rem;margin:1rem 0;text-align:center;">
-        <div style="font-family:'Space Mono',monospace;font-size:2.8rem;font-weight:700;color:{ac_c};">{acc:.1f}%</div>
-        <div style="color:#c9d8e8;font-size:1rem;margin-top:0.3rem;">News Signal Accuracy — {label}</div>
-        <div style="color:#6b8fad;font-size:0.82rem;margin-top:0.3rem;">
-            {corr} correct out of {total} · {sup_count} closed early by reversal · {len(waiting_df)} pending
-            · {st.session_state.get("nse_time","")}
+    # MFE directional accuracy
+    has_mfe = "mfe" in ready_df.columns and ready_df["mfe"].notna().any()
+    mfe_threshold = st.slider(
+        "📐 MFE threshold — min % move to count as 'directionally correct'",
+        min_value=0.1, max_value=5.0, value=0.5, step=0.1,
+        key="nse_mfe_thresh",
+        help="A signal is 'directionally correct' if price moved at least this % in the signal's direction at any point, even if it reversed by exit."
+    ) if has_mfe else 0.5
+
+    if has_mfe:
+        dir_correct_mask = ready_df["mfe"].notna() & (ready_df["mfe"] >= mfe_threshold)
+        dir_corr_n   = int(dir_correct_mask.sum())
+        dir_corr_acc = dir_corr_n / total * 100 if total > 0 else 0
+        dir_ac_c     = _ac(dir_corr_acc)
+        # Signals that were directionally right but exited wrong
+        right_dir_wrong_exit = int((dir_correct_mask) & (ready_df["correct"] == 0).sum())
+    else:
+        dir_corr_acc = None
+
+    # Two-panel banner: traditional vs directional
+    ban1, ban2 = st.columns(2)
+    with ban1:
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#0d1b2a,#0f2035);
+                    border:2px solid {ac_c}44;border-radius:16px;
+                    padding:1.4rem 2rem;margin:0.5rem 0;text-align:center;">
+            <div style="font-family:'Space Mono',monospace;font-size:2.6rem;font-weight:700;color:{ac_c};">{acc:.1f}%</div>
+            <div style="color:#c9d8e8;font-size:0.95rem;margin-top:0.3rem;">Exit Accuracy — {label}</div>
+            <div style="color:#6b8fad;font-size:0.78rem;margin-top:0.3rem;">
+                {corr} correct out of {total} at exit date · {sup_count} closed early · {len(waiting_df)} pending
+            </div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
+    with ban2:
+        if dir_corr_acc is not None:
+            dir_label = "Strong 🟢" if dir_corr_acc>=60 else ("Partial 🟡" if dir_corr_acc>=50 else "Weak 🔴")
+            st.markdown(f"""
+            <div style="background:linear-gradient(135deg,#0d1b2a,#0f2035);
+                        border:2px solid {dir_ac_c}44;border-radius:16px;
+                        padding:1.4rem 2rem;margin:0.5rem 0;text-align:center;">
+                <div style="font-family:'Space Mono',monospace;font-size:2.6rem;font-weight:700;color:{dir_ac_c};">{dir_corr_acc:.1f}%</div>
+                <div style="color:#c9d8e8;font-size:0.95rem;margin-top:0.3rem;">Directional Accuracy (MFE ≥ {mfe_threshold:.1f}%) — {dir_label}</div>
+                <div style="color:#6b8fad;font-size:0.78rem;margin-top:0.3rem;">
+                    Price moved in signal direction at some point · {dir_corr_n}/{total} signals
+                    {f"· {right_dir_wrong_exit} right direction, wrong exit timing" if right_dir_wrong_exit else ""}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div style="background:linear-gradient(135deg,#0d1b2a,#0f2035);
+                        border:2px solid #1e3a5f;border-radius:16px;
+                        padding:1.4rem 2rem;margin:0.5rem 0;text-align:center;">
+                <div style="font-family:'Space Mono',monospace;font-size:1.2rem;color:#6b8fad;">MFE data not available</div>
+                <div style="color:#6b8fad;font-size:0.8rem;margin-top:0.3rem;">Enable shock detection to compute excursion data</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.caption(f"Evaluated at {st.session_state.get('nse_time','')}")
+
+    # ── MFE Excursion section ──────────────────────────────────────────────
+    if has_mfe and total >= 5:
+        st.markdown('<div class="section-header">📐 Excursion Analysis — Right Direction, Wrong Timing?</div>', unsafe_allow_html=True)
+        st.caption(
+            "MFE = Maximum Favorable Excursion (how far price moved IN the signal's direction at its peak). "
+            "MAE = Maximum Adverse Excursion (worst move against the signal). "
+            "A high MFE with a negative final return = the thesis was right but news moved fast and the gain reversed."
+        )
+
+        exc_df = ready_df[ready_df["mfe"].notna()].copy()
+
+        # ── Excursion scatter: MFE vs final return ─────────────────────────
+        if len(exc_df) >= 3:
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            _style_fig(fig, list(axes))
+
+            ax1 = axes[0]
+            # Color: green = correct exit, red = incorrect exit
+            colors = [GREEN if c else RED for c in exc_df["correct"]]
+            ax1.scatter(exc_df["mfe"], exc_df["return_pct"],
+                        c=colors, alpha=0.75, edgecolors=BORDER, linewidth=0.5, s=60)
+            ax1.axhline(0, color=MUTED, linewidth=0.8, linestyle="--")
+            ax1.axvline(mfe_threshold, color=AMBER, linewidth=1, linestyle=":",
+                        label=f"MFE threshold {mfe_threshold:.1f}%")
+
+            # Annotate the "right direction, wrong exit" quadrant
+            ax1.fill_betweenx(
+                y=[-100, 0], x1=mfe_threshold, x2=exc_df["mfe"].max() * 1.1,
+                alpha=0.05, color=AMBER
+            )
+            ax1.text(
+                mfe_threshold + 0.1, exc_df["return_pct"].min() * 0.85,
+                "Right direction\nwrong timing", color=AMBER, fontsize=7, alpha=0.8
+            )
+            ax1.set_title("MFE vs Final Return", color=CYAN, fontsize=9)
+            ax1.set_xlabel("MFE % (best favourable move during hold)", color=MUTED, fontsize=8)
+            ax1.set_ylabel("Final Return %", color=MUTED, fontsize=8)
+            ax1.legend(fontsize=7, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
+            # Legend dots
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0],[0], marker='o', color='w', markerfacecolor=GREEN, markersize=7, label='Correct exit'),
+                Line2D([0],[0], marker='o', color='w', markerfacecolor=RED,   markersize=7, label='Incorrect exit'),
+            ]
+            ax1.legend(handles=legend_elements, fontsize=7, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
+
+            # MFE vs MAE bar comparison
+            ax2 = axes[1]
+            avg_mfe_corr = exc_df[exc_df["correct"]==1]["mfe"].mean()
+            avg_mfe_incr = exc_df[exc_df["correct"]==0]["mfe"].mean()
+            avg_mae_corr = exc_df[exc_df["correct"]==1]["mae"].mean()
+            avg_mae_incr = exc_df[exc_df["correct"]==0]["mae"].mean()
+
+            cats = ["Correct signals\nMFE", "Correct signals\nMAE",
+                    "Incorrect signals\nMFE", "Incorrect signals\nMAE"]
+            vals = [avg_mfe_corr or 0, avg_mae_corr or 0,
+                    avg_mfe_incr or 0, avg_mae_incr or 0]
+            bcolors2 = [GREEN, RED, AMBER, RED]
+            ax2.bar(cats, vals, color=bcolors2, edgecolor=BORDER, linewidth=0.4, alpha=0.85)
+            ax2.set_title("Avg MFE vs MAE: Correct vs Incorrect", color=CYAN, fontsize=9)
+            ax2.set_ylabel("% move", color=MUTED, fontsize=8)
+            for i, v in enumerate(vals):
+                if v > 0:
+                    ax2.text(i, v + 0.05, f"{v:.2f}%", ha="center", color=TEXT, fontsize=8)
+
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+        # ── Excursion summary table ────────────────────────────────────────
+        ex_corr = exc_df[exc_df["correct"]==1]
+        ex_incr = exc_df[exc_df["correct"]==0]
+        ex_dir  = exc_df[exc_df["mfe"] >= mfe_threshold]
+
+        exc_sum = pd.DataFrame([
+            {
+                "Group":              "All signals",
+                "Count":              len(exc_df),
+                "Avg MFE %":          round(exc_df["mfe"].mean(), 2),
+                "Avg MAE %":          round(exc_df["mae"].mean(), 2),
+                "Avg Exc. Ratio":     round(exc_df["excursion_ratio"].dropna().mean(), 3) if "excursion_ratio" in exc_df else np.nan,
+                "Dir. Correct":       f"{(exc_df['mfe'] >= mfe_threshold).sum()} ({(exc_df['mfe'] >= mfe_threshold).mean()*100:.0f}%)",
+            },
+            {
+                "Group":              "✅ Correct exit",
+                "Count":              len(ex_corr),
+                "Avg MFE %":          round(ex_corr["mfe"].mean(), 2) if len(ex_corr) else np.nan,
+                "Avg MAE %":          round(ex_corr["mae"].mean(), 2) if len(ex_corr) else np.nan,
+                "Avg Exc. Ratio":     round(ex_corr["excursion_ratio"].dropna().mean(), 3) if len(ex_corr) and "excursion_ratio" in ex_corr else np.nan,
+                "Dir. Correct":       f"{(ex_corr['mfe'] >= mfe_threshold).sum()}" if len(ex_corr) else "—",
+            },
+            {
+                "Group":              "❌ Incorrect exit",
+                "Count":              len(ex_incr),
+                "Avg MFE %":          round(ex_incr["mfe"].mean(), 2) if len(ex_incr) else np.nan,
+                "Avg MAE %":          round(ex_incr["mae"].mean(), 2) if len(ex_incr) else np.nan,
+                "Avg Exc. Ratio":     round(ex_incr["excursion_ratio"].dropna().mean(), 3) if len(ex_incr) and "excursion_ratio" in ex_incr else np.nan,
+                "Dir. Correct":       f"{(ex_incr['mfe'] >= mfe_threshold).sum()} ← right direction, timed out" if len(ex_incr) else "—",
+            },
+        ])
+        def _cmfe(v):
+            try:
+                n = float(str(v).split()[0])
+                return f"color:{GREEN}" if n >= 1 else f"color:{MUTED}"
+            except Exception:
+                return ""
+        st.dataframe(
+            exc_sum.style.format({"Avg MFE %": "{:.2f}%", "Avg MAE %": "{:.2f}%", "Avg Exc. Ratio": "{:.3f}"}, na_rep="—"),
+            use_container_width=True, hide_index=True
+        )
+
+        if len(ex_incr) > 0:
+            rt_wrong = int((ex_incr["mfe"] >= mfe_threshold).sum())
+            if rt_wrong > 0:
+                pct_rt = rt_wrong / len(ex_incr) * 100
+                st.warning(
+                    f"⚡ **{rt_wrong} of your {len(ex_incr)} 'incorrect' signals ({pct_rt:.0f}%) were actually right in direction** — "
+                    f"price moved ≥{mfe_threshold:.1f}% favourably before reversing. "
+                    f"These are timing/exit issues, not thesis failures. "
+                    f"Consider tighter take-profit targets or shorter hold horizons for news-driven signals."
+                )
+
+
 
     # ── Confidence table ───────────────────────────────────────────────────
     st.markdown('<div class="section-header">🎯 Accuracy by Confidence Level</div>', unsafe_allow_html=True)
@@ -373,8 +552,9 @@ def run_news_signal_evaluator():
 
     # ── Full table ─────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">📋 All Evaluated Signals</div>', unsafe_allow_html=True)
-    disp_cols = ["date","ticker","action","confidence","time_horizon","held_days",
-                 "entry_price","exit_price","return_pct","outcome","superseded","exit_reason","article"]
+    disp_cols = ["date","entry_date","ticker","action","confidence","time_horizon","held_td",
+                 "entry_price","exit_price","return_pct","mfe","mae","excursion_ratio",
+                 "directional_correct","outcome","superseded","exit_reason","article"]
     disp = ready_df[[c for c in disp_cols if c in ready_df.columns]].copy()
     def c_a(v): return f"color:{GREEN}" if v=="BUY" else f"color:{RED}"
     def c_o(v): return f"color:{GREEN}" if "Correct" in str(v) else f"color:{RED}"
@@ -382,16 +562,23 @@ def run_news_signal_evaluator():
         if pd.isna(v): return ""
         return f"color:{GREEN}" if v>0 else f"color:{RED}"
     def c_s(v): return f"color:{AMBER}" if v else ""
+    def c_dc(v): return f"color:{GREEN}" if v else f"color:{MUTED}"
     sty_d = disp.style
-    if "action"     in disp.columns: sty_d = sty_d.map(c_a, subset=["action"])
-    if "outcome"    in disp.columns: sty_d = sty_d.map(c_o, subset=["outcome"])
-    if "return_pct" in disp.columns: sty_d = sty_d.map(c_r, subset=["return_pct"])
-    if "superseded" in disp.columns: sty_d = sty_d.map(c_s, subset=["superseded"])
-    sty_d = sty_d.format({
-        "entry_price": "${:.2f}",
-        "exit_price":  "${:.2f}",
-        "return_pct":  lambda x: f"{x:+.2f}%" if pd.notna(x) else "—",
-    })
+    if "action"            in disp.columns: sty_d = sty_d.map(c_a,  subset=["action"])
+    if "outcome"           in disp.columns: sty_d = sty_d.map(c_o,  subset=["outcome"])
+    if "return_pct"        in disp.columns: sty_d = sty_d.map(c_r,  subset=["return_pct"])
+    if "mfe"               in disp.columns: sty_d = sty_d.map(c_r,  subset=["mfe"])
+    if "superseded"        in disp.columns: sty_d = sty_d.map(c_s,  subset=["superseded"])
+    if "directional_correct" in disp.columns: sty_d = sty_d.map(c_dc, subset=["directional_correct"])
+    fmt = {
+        "entry_price":       "${:.2f}",
+        "exit_price":        "${:.2f}",
+        "return_pct":        lambda x: f"{x:+.2f}%" if pd.notna(x) else "—",
+        "mfe":               lambda x: f"+{x:.2f}%" if pd.notna(x) else "—",
+        "mae":               lambda x: f"-{x:.2f}%" if pd.notna(x) else "—",
+        "excursion_ratio":   lambda x: f"{x:.2f}" if pd.notna(x) else "—",
+    }
+    sty_d = sty_d.format(fmt)
     st.dataframe(sty_d, use_container_width=True, hide_index=True)
 
     # ── Honest interpretation ──────────────────────────────────────────────
