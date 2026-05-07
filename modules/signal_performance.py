@@ -6,12 +6,16 @@ supersession, and black swan detection.
 import streamlit as st
 import pandas as pd
 import numpy as np
+import sqlite3
+from pathlib import Path
 from datetime import datetime, timedelta
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings("ignore")
+
+DB_PATH = Path(__file__).parent.parent / "signal_history.db"
 
 BLUE=  "#38bdf8"; CYAN=  "#7dd3fc"; AMBER= "#fbbf24"
 RED=   "#f87171"; GREEN= "#4ade80"; CARD=  "#0d1b2a"
@@ -61,17 +65,28 @@ def _fetch_ohlc(ticker: str, entry_date: str, exit_date: str,
 
 
 def _load_signals(days_back, src_filter=None, act_filter=None):
-    from modules.signal_history import get_signals_df
-    return get_signals_df(
-        days_back=days_back,
-        source_filter=src_filter,
-        action_filter=act_filter
-    )
+    try:
+        conn   = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        cutoff = (datetime.now()-timedelta(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
+        df = pd.read_sql_query(
+            "SELECT * FROM signals WHERE timestamp>=? AND action IN ('BUY','SHORT') ORDER BY timestamp",
+            conn, params=(cutoff,))
+        conn.close()
+    except Exception:
+        return pd.DataFrame()
+    if src_filter: df = df[df["source"].isin(src_filter)]
+    if act_filter: df = df[df["action"].isin(act_filter)]
+    return df
 
 
 def _load_full():
-    from modules.signal_history import get_signals_df
-    return get_signals_df(days_back=3650, action_filter=["BUY", "SHORT"])
+    try:
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        df   = pd.read_sql_query("SELECT * FROM signals WHERE action IN ('BUY','SHORT') ORDER BY timestamp", conn)
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 def _mb(label, value, color=None):
@@ -128,7 +143,7 @@ def run_signal_performance():
         df_raw  = _load_signals(days_back, src_filter or None, act_filter or None)
         df_full = _load_full()
         if df_raw.empty:
-            st.warning("No signals found in Supabase. Run Live News Feed and Ticker Signals to build history.")
+            st.warning("No signals found. Run Live News Feed and Ticker Signals to build history.")
             return
 
         prog = st.progress(0)
@@ -138,7 +153,7 @@ def run_signal_performance():
         ready_df, waiting_df, inconclusive_df = evaluate_signals(
             df                       = df_raw,
             fetch_price_fn           = _fetch_price,
-            fetch_ohlc_fn            = _fetch_ohlc,
+            fetch_ohlc_fn            = _fetch_ohlc,   # always on — needed for MFE/MAE + optional shock detection
             all_signals_for_timeline = df_full,
             progress_callback        = _cb,
         )
@@ -193,29 +208,87 @@ def run_signal_performance():
     if sup_count > 0:
         st.info(f"ℹ️ {sup_count} signal(s) were closed early by an opposing signal — evaluated at that earlier exit date.")
 
-    # ── Accuracy banner ────────────────────────────────────────────────────
+    # ── Accuracy banner — directional is PRIMARY ───────────────────────────
     total = len(ready_df)
     corr  = int(ready_df["correct"].sum())
     acc   = corr/total*100 if total>0 else 0
     ac    = GREEN if acc>=60 else (AMBER if acc>=50 else RED)
     label = "Strong Edge 🟢" if acc>=60 else ("Marginal 🟡" if acc>=50 else "Below Random 🔴")
 
-    st.markdown(f"""
-    <div style="background:linear-gradient(135deg,#0d1b2a,#0f2035);
-                border:2px solid {ac}44;border-radius:16px;
-                padding:1.4rem 2rem;margin:1rem 0;text-align:center;">
-        <div style="font-family:'Space Mono',monospace;font-size:2.8rem;font-weight:700;color:{ac};">{acc:.1f}%</div>
-        <div style="color:#c9d8e8;font-size:1rem;margin-top:0.3rem;">Overall Signal Accuracy — {label}</div>
-        <div style="color:#6b8fad;font-size:0.82rem;margin-top:0.3rem;">
-            {corr} correct · {total-corr} incorrect · {sup_count} early exits ·
-            {len(inconclusive_df)} excluded (external shock) · {len(waiting_df)} pending
+    st.caption(
+        "📊 **Price data:** Daily OHLC (Yahoo Finance). "
+        "Entry = OPEN of entry day · Exit = CLOSE of exit day · "
+        "MFE/MAE use intraday High/Low — so intraday range is captured, but not tick-by-tick."
+    )
+
+    has_mfe = "mfe" in ready_df.columns and ready_df["mfe"].notna().any()
+    mfe_threshold = st.slider(
+        "📐 MFE threshold — min % move to count as 'directionally correct'",
+        min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="sp_mfe_thresh",
+        help="If price moved this far in the signal's direction at any point, it's 'directionally correct' even if the exit was negative."
+    ) if has_mfe else 0.5
+
+    if has_mfe:
+        dir_mask  = ready_df["mfe"].notna() & (ready_df["mfe"] >= mfe_threshold)
+        dir_acc   = dir_mask.mean() * 100
+        dir_ac_c  = GREEN if dir_acc>=60 else (AMBER if dir_acc>=50 else RED)
+        dir_n     = int(dir_mask.sum())
+        right_wrong = int((dir_mask & (ready_df["correct"] == 0)).sum())
+        dir_label = "Strong 🟢" if dir_acc>=60 else ("Partial 🟡" if dir_acc>=50 else "Weak 🔴")
+    else:
+        dir_acc = None
+
+    ban1, ban2 = st.columns([3, 2])
+    with ban1:
+        if dir_acc is not None:
+            st.markdown(f"""
+            <div style="background:linear-gradient(135deg,#0d1b2a,#0f2035);
+                        border:2px solid {dir_ac_c}55;border-radius:16px;
+                        padding:1.6rem 2rem;margin:.5rem 0;text-align:center;">
+                <div style="color:#6b8fad;font-size:.72rem;font-family:'Space Mono',monospace;
+                            letter-spacing:.1em;text-transform:uppercase;margin-bottom:.4rem;">
+                    Directional Accuracy (MFE ≥ {mfe_threshold:.1f}%)
+                </div>
+                <div style="font-family:'Space Mono',monospace;font-size:3rem;font-weight:700;
+                            color:{dir_ac_c};line-height:1;">{dir_acc:.1f}%</div>
+                <div style="color:#c9d8e8;font-size:.88rem;margin-top:.4rem;">{dir_label} — price moved in signal direction</div>
+                <div style="color:#6b8fad;font-size:.75rem;margin-top:.3rem;">
+                    {dir_n}/{total} signals · {right_wrong} right direction but reversed before exit
+                </div>
+                <div style="margin-top:.8rem;padding:.5rem .8rem;background:rgba(255,255,255,.04);
+                            border-radius:8px;font-size:.75rem;color:#8ba3c1;">
+                    Exit accuracy (fixed-horizon close): <b style="color:{ac};">{acc:.1f}%</b>
+                    ({corr}/{total} correct · {label})
+                </div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div style="background:linear-gradient(135deg,#0d1b2a,#0f2035);
+                        border:2px solid {ac}44;border-radius:16px;
+                        padding:1.6rem 2rem;margin:.5rem 0;text-align:center;">
+                <div style="font-family:'Space Mono',monospace;font-size:3rem;font-weight:700;color:{ac};">{acc:.1f}%</div>
+                <div style="color:#c9d8e8;font-size:1rem;margin-top:.3rem;">Overall Accuracy — {label}</div>
+                <div style="color:#6b8fad;font-size:.82rem;margin-top:.3rem;">
+                    {corr}/{total} · {sup_count} early exits · {len(inconclusive_df)} excluded · {len(waiting_df)} pending
+                </div>
+            </div>""", unsafe_allow_html=True)
+    with ban2:
+        st.markdown(f"""
+        <div style="background:#0d1b2a;border:1px solid #1e3a5f;border-radius:12px;
+                    padding:1.2rem;margin:.5rem 0;font-size:.82rem;color:#8ba3c1;line-height:1.7;">
+            <b style="color:#7dd3fc;">Why two numbers?</b><br>
+            <b>Directional</b> = did price move your way at any point during the hold?
+            The thesis was right even if the gain reversed.<br>
+            <b>Exit</b> = was price up at the fixed exit timestamp?
+            This penalises signals that were right but the gain faded before exit.<br><br>
+            For news signals, directional is more meaningful — news moves fast.
         </div>
-    </div>""", unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
     if total < 20:
         st.warning(f"⚠️ {total} evaluated signals — need 20+ for reliable conclusions.")
 
-    # ── Metrics ────────────────────────────────────────────────────────────
+    # ── Metrics row ────────────────────────────────────────────────────────
     wins  = ready_df[ready_df["correct"]==1]["return_pct"]
     loses = ready_df[ready_df["correct"]==0]["return_pct"]
     aw    = float(wins.mean())  if not wins.empty  else 0
@@ -223,36 +296,28 @@ def run_signal_performance():
     rr    = abs(aw/al) if al!=0 else 0
     rr_c  = GREEN if rr>=2 else (AMBER if rr>=1 else RED)
 
-    has_mfe = "mfe" in ready_df.columns and ready_df["mfe"].notna().any()
-    mfe_threshold = st.slider(
-        "📐 MFE threshold — min % move to count as 'directionally correct'",
-        min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="sp_mfe_thresh",
-    ) if has_mfe else 0.5
-
-    if has_mfe:
-        dir_mask  = ready_df["mfe"].notna() & (ready_df["mfe"] >= mfe_threshold)
-        dir_acc   = dir_mask.mean() * 100
-        dir_ac_c  = GREEN if dir_acc>=60 else (AMBER if dir_acc>=50 else RED)
-    else:
-        dir_acc   = None
-
     m1,m2,m3,m4,m5,m6 = st.columns(6)
-    with m1: _mb("Exit Accuracy",   f"{acc:.1f}%",  ac)
-    with m2: _mb("Avg Win",         f"+{aw:.1f}%",  GREEN)
-    with m3: _mb("Avg Loss",        f"{al:.1f}%",   RED)
-    with m4: _mb("Win/Loss Ratio",  f"{rr:.2f}",    rr_c)
-    with m5: _mb("Evaluated",       str(total),     BLUE)
-    with m6:
+    with m1:
         if dir_acc is not None:
             _mb("Dir. Accuracy", f"{dir_acc:.1f}%", dir_ac_c)
         else:
-            _mb("Excl. Shock", str(len(inconclusive_df)), AMBER)
+            _mb("Accuracy", f"{acc:.1f}%", ac)
+    with m2: _mb("Exit Accuracy",  f"{acc:.1f}%",  ac)
+    with m3: _mb("Avg Win",        f"+{aw:.1f}%",  GREEN)
+    with m4: _mb("Avg Loss",       f"{al:.1f}%",   RED)
+    with m5: _mb("Win/Loss Ratio", f"{rr:.2f}",    rr_c)
+    with m6: _mb("Evaluated",      str(total),     BLUE)
 
     st.markdown("")
 
     # ── MFE Excursion section ──────────────────────────────────────────────
     if has_mfe:
         st.markdown('<div class="section-header">📐 Excursion Analysis (MFE / MAE)</div>', unsafe_allow_html=True)
+        st.caption(
+            f"MFE = best favourable move during hold (intraday High/Low) · MAE = worst adverse move. "
+            f"Points in the amber zone had MFE ≥ {mfe_threshold:.1f}% but ended negative — "
+            f"right direction, wrong timing."
+        )
         exc_df = ready_df[ready_df["mfe"].notna()].copy()
         if len(exc_df) >= 3:
             fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -266,11 +331,14 @@ def run_signal_performance():
             ax1.axvline(mfe_threshold, color=AMBER, linewidth=1, linestyle=":",
                         label=f"MFE ≥ {mfe_threshold:.1f}%")
             ymin = exc_df["return_pct"].min()
-            ax1.fill_betweenx([ymin * 1.05, 0],
-                              mfe_threshold, exc_df["mfe"].max() * 1.1,
-                              alpha=0.05, color=AMBER)
+            if ymin < 0 and exc_df["mfe"].max() > mfe_threshold:
+                ax1.fill_betweenx([ymin * 1.05, 0],
+                                  mfe_threshold, exc_df["mfe"].max() * 1.1,
+                                  alpha=0.05, color=AMBER)
+                ax1.text(mfe_threshold + 0.1, ymin * 0.9,
+                         "Right dir.\nwrong timing", color=AMBER, fontsize=7, alpha=0.85)
             ax1.set_title("MFE vs Final Return %", color=CYAN, fontsize=9)
-            ax1.set_xlabel("MFE % (best move in signal direction)", color=MUTED, fontsize=8)
+            ax1.set_xlabel("MFE % (intraday High/Low — best move in signal direction)", color=MUTED, fontsize=8)
             ax1.set_ylabel("Final Return %", color=MUTED, fontsize=8)
             from matplotlib.lines import Line2D
             ax1.legend(handles=[
@@ -294,6 +362,7 @@ def run_signal_performance():
             ax2.legend(fontsize=8, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
             fig.tight_layout(); st.pyplot(fig); plt.close(fig)
 
+            # Insight callout
             if len(incr_s) > 0:
                 timing_victims = int((incr_s["mfe"] >= mfe_threshold).sum())
                 if timing_victims > 0:
@@ -302,6 +371,7 @@ def run_signal_performance():
                         f"were directionally right** — price moved ≥{mfe_threshold:.1f}% favourably but reversed before exit. "
                         f"True directional accuracy: **{dir_acc:.1f}%** vs exit accuracy **{acc:.1f}%**."
                     )
+
 
     # ── Normal vs early-exit comparison ───────────────────────────────────
     if "superseded" in ready_df.columns and sup_count > 0:
@@ -355,21 +425,34 @@ def run_signal_performance():
     # ── By horizon ─────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">⏱ Accuracy by Time Horizon</div>', unsafe_allow_html=True)
     hh = st.columns(4)
-    for i, (lbl, td) in enumerate([("Intraday",1),("Swing",5),("Medium",14),("Long",30)]):
-        sub = ready_df[ready_df["horizon_td"]==td]
+    # Intraday: h_td=0 (new) or h_td=1 (old cached) — check both
+    horizon_buckets = [
+        ("Intraday",  lambda df: df[df["horizon_td"] <= 1]),
+        ("Swing",     lambda df: df[df["horizon_td"] == 5]),
+        ("Medium",    lambda df: df[df["horizon_td"] == 14]),
+        ("Long",      lambda df: df[df["horizon_td"] == 30]),
+    ]
+    for i, (lbl, filter_fn) in enumerate(horizon_buckets):
+        sub = filter_fn(ready_df)
         with hh[i]:
-            if len(sub)>=3:
-                a = sub["correct"].mean()*100
+            if len(sub) >= 3:
+                a   = sub["correct"].mean() * 100
                 ac3 = GREEN if a>=60 else (AMBER if a>=50 else RED)
-                st.markdown(f'<div class="metric-box"><div class="label">{lbl} ({td}td)</div>'
-                            f'<div class="value" style="color:{ac3};">{a:.1f}%</div>'
-                            f'<div style="color:#6b8fad;font-size:0.7rem;">n={len(sub)}</div></div>',
-                            unsafe_allow_html=True)
+                d_a = (sub["mfe"].notna() & (sub["mfe"] >= mfe_threshold)).mean() * 100 if has_mfe and len(sub) else None
+                st.markdown(
+                    f'<div class="metric-box">'
+                    f'<div class="label">{lbl}</div>'
+                    f'<div class="value" style="color:{ac3};">{a:.1f}%</div>'
+                    f'<div style="color:#6b8fad;font-size:.7rem;">exit acc · n={len(sub)}</div>'
+                    + (f'<div style="color:#38bdf8;font-size:.7rem;">dir: {d_a:.0f}%</div>' if d_a is not None else '')
+                    + '</div>',
+                    unsafe_allow_html=True)
             else:
-                st.markdown(f'<div class="metric-box"><div class="label">{lbl}</div>'
-                            f'<div class="value" style="color:{MUTED};">—</div>'
-                            f'<div style="color:#6b8fad;font-size:0.7rem;">n={len(sub)}</div></div>',
-                            unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="metric-box"><div class="label">{lbl}</div>'
+                    f'<div class="value" style="color:{MUTED};">—</div>'
+                    f'<div style="color:#6b8fad;font-size:.7rem;">n={len(sub)}</div></div>',
+                    unsafe_allow_html=True)
 
     # ── Chart ──────────────────────────────────────────────────────────────
     rets = ready_df["return_pct"].dropna()

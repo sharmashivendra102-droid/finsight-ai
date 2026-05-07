@@ -2,20 +2,34 @@
 eval_core.py — Shared evaluation logic
 =======================================
 
-Fixes applied:
-  1. Trading days not calendar days — INTRADAY = 1 trading day, SWING = 5 trading days
-  2. Next-trading-day entry — entry price is ALWAYS the close of the first
-     trading day AFTER the signal date, regardless of what time the signal
-     arrived.  A signal at 3 pm Friday → entry = Monday close.  A signal at
-     9 am Monday → entry = Tuesday close.  This is the only realistic model:
-     by the time a news signal is fetched, Groq-analysed, and a trader acts,
-     same-day execution at the exact signal timestamp is not reliable.
-  3. Black swan detection — if a volatility spike (VIX >20% move OR stock 
-     moves >3x its normal daily range) occurs during the window, the signal 
-     is flagged as "inconclusive — external shock" and excluded from accuracy 
-     stats by default
-  4. Supersession — if opposing signal arrives before the evaluation date, 
-     exit at that earlier date
+Design principles:
+  1. Next-trading-day OPEN entry — entry price is ALWAYS the OPEN of the first
+     trading day AFTER the signal date.  A Saturday 3pm signal → enter at
+     Monday OPEN.  This is the only coherent model: the signal arrives when
+     markets are closed; the first possible trade is the next open.
+     Using the OPEN (not close) means the entire intraday range of that day
+     is captured in MFE/MAE — if the stock moved your direction intraday but
+     reversed by close, you see it.
+
+  2. INTRADAY horizon = same-day close.  h_td = 0 means exit at the CLOSE of
+     the entry day.  Entry Monday OPEN → exit Monday CLOSE.  This is what
+     "intraday" actually means.  All other horizons use N trading-day closes
+     from the entry date.
+
+  3. Trading days not calendar days — SWING = 5 td, MEDIUM = 14 td, LONG = 30 td.
+
+  4. Readiness = max(1, h_td) trading days elapsed from entry — need at least
+     1 td so the entry day's close price is available.
+
+  5. Black swan detection — signals where the stock moved >3x its normal daily
+     range are flagged "inconclusive" and excluded from accuracy stats.
+
+  6. Supersession — if an opposing signal arrives before the planned exit,
+     the trade closes early at that date (multi-day horizons only).
+
+  7. MFE/MAE — Maximum Favorable/Adverse Excursion over the hold window,
+     computed from intraday High/Low.  Captures "was the thesis ever right?"
+     independently of where the price ended up at formal exit.
 """
 
 import pandas as pd
@@ -24,8 +38,10 @@ from datetime import datetime, timedelta
 
 
 # ── Horizon definitions in TRADING DAYS ──────────────────────────────────────
+# h_td = 0 → INTRADAY: exit at CLOSE of entry day (same day as entry OPEN)
+# h_td > 0 → exit at CLOSE of the Nth trading day after entry
 HORIZON_TRADING_DAYS = {
-    "INTRADAY":          1,    # evaluate at close of next trading day
+    "INTRADAY":          0,    # entry OPEN → same-day CLOSE
     "SWING (1-5 DAYS)":  5,    # 5 trading days = 1 calendar week
     "SWING":             5,
     "MEDIUM (WEEKS)":   14,    # ~3 calendar weeks
@@ -65,7 +81,7 @@ def get_horizon_trading_days(horizon_str: str) -> int:
 
 
 def horizon_label(td: int) -> str:
-    if td <= 1:  return "Intraday (1 trading day)"
+    if td == 0:  return "Intraday (entry open → same-day close)"
     if td <= 5:  return "Swing (5 trading days)"
     if td <= 14: return "Medium (14 trading days)"
     return "Long (30 trading days)"
@@ -297,6 +313,46 @@ def _compute_mfe_mae(ticker: str, entry_date_str: str, exit_date_str: str,
         return empty
 
 
+# ── Entry price helper ────────────────────────────────────────────────────────
+
+def _get_entry_open_price(ticker: str, date_str: str, fetch_ohlc_fn) -> float | None:
+    """
+    Return the OPENING price of the given trading date.
+
+    Using OPEN as entry price is critical for correctness:
+    - Signal arrives Saturday → entry day is Monday
+    - Monday OPEN is the first price a trader actually sees
+    - The full Monday intraday range (High/Low) then lies between entry and exit
+    - MFE/MAE therefore captures everything that happened that day
+
+    If the Open column is unavailable, returns None so the caller can fall
+    back to the day's Close via fetch_price_fn.
+    """
+    if fetch_ohlc_fn is None:
+        return None
+    try:
+        # Fetch a small window around the target date
+        hist = fetch_ohlc_fn(ticker, date_str, date_str, lookback_days=3)
+        if hist is None or hist.empty:
+            return None
+
+        target_date = pd.Timestamp(date_str).date()
+        day_row = hist[hist.index.date == target_date]
+
+        if day_row.empty:
+            # Fall forward to nearest trading day on or after target
+            after = hist[hist.index.date >= target_date]
+            if after.empty:
+                return None
+            day_row = after.iloc[[0]]
+
+        col = "Open" if "Open" in day_row.columns else "Close"
+        val = float(day_row[col].iloc[0])
+        return val if val > 0 else None
+    except Exception:
+        return None
+
+
 # ── Main evaluation function ──────────────────────────────────────────────────
 
 def evaluate_signals(
@@ -348,12 +404,10 @@ def evaluate_signals(
         h_td   = get_horizon_trading_days(row.get("time_horizon", ""))
 
         # ── Determine entry date — always NEXT trading day after signal ────
-        # Rationale: regardless of what time the signal arrived (3 pm, 9 am,
-        # midnight), same-day execution at the signal timestamp is not
-        # realistic.  A 3 pm Friday signal → entry = Monday close.
+        # A Saturday signal → first possible entry = Monday OPEN.
+        # A Friday 3pm signal → first possible entry = Monday OPEN.
         next_tds = trading_dates[trading_dates.date > sig_ts.date()]
         if len(next_tds) == 0:
-            # No trading day found after signal — too recent
             base_early = {
                 "timestamp":    row["timestamp"],
                 "date":         row["timestamp"][:10],
@@ -372,13 +426,16 @@ def evaluate_signals(
             waiting.append(base_early)
             continue
 
-        entry_ts       = pd.Timestamp(next_tds[0])          # e.g. Monday for Friday signal
+        entry_ts       = pd.Timestamp(next_tds[0])   # e.g. Monday for Sat/Fri signal
         entry_date_str = entry_ts.strftime("%Y-%m-%d")
 
-        # Readiness: have h_td trading days elapsed since entry_ts?
-        td_elapsed_entry = _trading_days_elapsed(entry_ts, trading_dates)
-        # Also track elapsed from signal date for display
-        td_elapsed_signal = _trading_days_elapsed(sig_ts, trading_dates)
+        # ── Readiness ─────────────────────────────────────────────────────
+        # INTRADAY (h_td=0): need ≥1 td elapsed since entry so the entry
+        # day's close price is settled.
+        # All other horizons: need ≥h_td td elapsed since entry.
+        ready_td          = max(1, h_td)
+        td_elapsed_entry  = _trading_days_elapsed(entry_ts, trading_dates)
+        td_elapsed_signal = _trading_days_elapsed(sig_ts,   trading_dates)
 
         base = {
             "timestamp":    row["timestamp"],
@@ -390,49 +447,65 @@ def evaluate_signals(
             "source":       row.get("source", ""),
             "time_horizon": row.get("time_horizon", ""),
             "horizon_td":   h_td,
-            "td_elapsed":   td_elapsed_entry,   # days elapsed from entry
-            "days_elapsed": td_elapsed_signal,  # days elapsed from signal (display)
+            "td_elapsed":   td_elapsed_entry,
+            "days_elapsed": td_elapsed_signal,
             "reasoning":    str(row.get("reasoning", ""))[:100],
             "article":      str(row.get("article_title", ""))[:70],
             "urgency":      row.get("urgency", ""),
         }
 
-        # ── Not enough TRADING days have passed since entry ────────────────
-        if td_elapsed_entry < h_td:
-            remaining = h_td - td_elapsed_entry
+        if td_elapsed_entry < ready_td:
+            remaining    = ready_td - td_elapsed_entry
+            horizon_desc = "same-day close" if h_td == 0 else f"{h_td} trading days"
             base["not_ready_reason"] = (
                 f"Wait {remaining} more trading day{'s' if remaining != 1 else ''} "
-                f"(entry {entry_date_str}, {h_td} trading days needed, "
-                f"{td_elapsed_entry} elapsed from entry)"
+                f"(entry {entry_date_str}, horizon={horizon_desc}, "
+                f"{td_elapsed_entry}/{ready_td} td elapsed)"
             )
             waiting.append(base)
             continue
 
-        # ── Find planned exit date (h_td trading days after ENTRY) ────────
-        planned_exit_ts = _add_trading_days(entry_ts, h_td, trading_dates)
-        if planned_exit_ts is None:
-            base["not_ready_reason"] = "Not enough trading day history to compute exit"
-            waiting.append(base)
-            continue
-
-        # ── Supersession check ─────────────────────────────────────────────
-        actual_exit_ts, exit_reason = find_exit_date(
-            ticker          = row["ticker"],
-            signal_ts       = sig_ts,
-            signal_action   = row["action"],
-            planned_exit_ts = planned_exit_ts,
-            ticker_timeline = ticker_timeline,
-        )
-
-        # ── Fetch prices — entry = next trading day close ──────────────────
-        entry_price = fetch_price_fn(row["ticker"], entry_date_str)
+        # ── Entry price: OPEN of the entry day ────────────────────────────
+        # OPEN is the first available price after the signal.  It means the
+        # full intraday range lies between entry and exit, so MFE/MAE is
+        # accurate.  Falls back to Close if OHLC data is unavailable.
+        entry_price = _get_entry_open_price(row["ticker"], entry_date_str, fetch_ohlc_fn)
+        entry_type  = "open"
+        if entry_price is None or entry_price <= 0:
+            entry_price = fetch_price_fn(row["ticker"], entry_date_str)
+            entry_type  = "close_fallback"
         if entry_price is None or entry_price <= 0:
             base["not_ready_reason"] = f"Entry price unavailable for {entry_date_str}"
             waiting.append(base)
             continue
 
-        exit_date_str = actual_exit_ts.strftime("%Y-%m-%d")
-        exit_price    = fetch_price_fn(row["ticker"], exit_date_str)
+        # ── Exit date and price ────────────────────────────────────────────
+        if h_td == 0:
+            # INTRADAY: hold from OPEN to CLOSE of the same trading day.
+            # No supersession check — single-day hold.
+            actual_exit_ts = entry_ts
+            exit_date_str  = entry_date_str
+            exit_reason    = "intraday_close"
+            exit_price     = fetch_price_fn(row["ticker"], exit_date_str)
+        else:
+            # Multi-day: h_td trading-day closes after entry.
+            planned_exit_ts = _add_trading_days(entry_ts, h_td, trading_dates)
+            if planned_exit_ts is None:
+                base["not_ready_reason"] = "Not enough trading day history to compute exit"
+                waiting.append(base)
+                continue
+
+            # Supersession: opposing signal closes the trade early
+            actual_exit_ts, exit_reason = find_exit_date(
+                ticker          = row["ticker"],
+                signal_ts       = sig_ts,
+                signal_action   = row["action"],
+                planned_exit_ts = planned_exit_ts,
+                ticker_timeline = ticker_timeline,
+            )
+            exit_date_str = actual_exit_ts.strftime("%Y-%m-%d")
+            exit_price    = fetch_price_fn(row["ticker"], exit_date_str)
+
         if exit_price is None or exit_price <= 0:
             base["not_ready_reason"] = f"Exit price unavailable for {exit_date_str}"
             waiting.append(base)
@@ -474,12 +547,13 @@ def evaluate_signals(
         result = {
             **base,
             "entry_date":          entry_date_str,
+            "entry_type":          entry_type,          # "open" or "close_fallback"
             "entry_price":         round(entry_price, 2),
             "exit_price":          round(exit_price, 2),
             "exit_date":           exit_date_str,
             "held_td":             held_td,
             "exit_reason":         exit_reason,
-            "superseded":          exit_reason != "horizon",
+            "superseded":          exit_reason not in ("horizon", "intraday_close"),
             "return_pct":          round(pnl_ret, 3),
             "correct":             correct,
             "outcome":             "✅ Correct" if correct else "❌ Incorrect",
