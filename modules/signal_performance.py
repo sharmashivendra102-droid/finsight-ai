@@ -1,21 +1,18 @@
 """
 Signal Performance Tracker — uses eval_core with trading-day counting,
 supersession, and black swan detection.
+FIXED: reads from Supabase instead of SQLite so data persists across redeploys.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import sqlite3
-from pathlib import Path
 from datetime import datetime, timedelta
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings("ignore")
-
-DB_PATH = Path(__file__).parent.parent / "signal_history.db"
 
 BLUE=  "#38bdf8"; CYAN=  "#7dd3fc"; AMBER= "#fbbf24"
 RED=   "#f87171"; GREEN= "#4ade80"; CARD=  "#0d1b2a"
@@ -64,29 +61,37 @@ def _fetch_ohlc(ticker: str, entry_date: str, exit_date: str,
         return None
 
 
+# ── FIXED: reads from Supabase, not SQLite ───────────────────────────────────
+
 def _load_signals(days_back, src_filter=None, act_filter=None):
+    """Load signals from Supabase for the given filters."""
     try:
-        conn   = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        cutoff = (datetime.now()-timedelta(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
-        df = pd.read_sql_query(
-            "SELECT * FROM signals WHERE timestamp>=? AND action IN ('BUY','SHORT') ORDER BY timestamp",
-            conn, params=(cutoff,))
-        conn.close()
-    except Exception:
+        from modules.signal_history import get_signals_df
+        df = get_signals_df(
+            days_back=days_back,
+            source_filter=src_filter or None,
+            action_filter=act_filter or ["BUY", "SHORT"],
+        )
+        if df.empty:
+            return pd.DataFrame()
+        return df.sort_values("timestamp").reset_index(drop=True)
+    except Exception as e:
+        st.error(f"Could not load signals from Supabase: {e}")
         return pd.DataFrame()
-    if src_filter: df = df[df["source"].isin(src_filter)]
-    if act_filter: df = df[df["action"].isin(act_filter)]
-    return df
 
 
 def _load_full():
+    """Load ALL BUY/SHORT signals from Supabase for supersession timeline."""
     try:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        df   = pd.read_sql_query("SELECT * FROM signals WHERE action IN ('BUY','SHORT') ORDER BY timestamp", conn)
-        conn.close()
-        return df
+        from modules.signal_history import get_signals_df
+        df = get_signals_df(days_back=3650, action_filter=["BUY", "SHORT"])
+        if df.empty:
+            return pd.DataFrame()
+        return df.sort_values("timestamp").reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _mb(label, value, color=None):
@@ -130,9 +135,7 @@ def run_signal_performance():
     detect_shocks = st.checkbox(
         "🌪️ Detect and exclude black swan / external shock events",
         value=True,
-        help="Flags signals where the stock moved 3× its normal daily range during the eval window. "
-             "These are marked 'inconclusive' and excluded from accuracy stats. "
-             "Uncheck to include them (they'll count as correct or incorrect)."
+        help="Flags signals where the stock moved 3× its normal daily range during the eval window."
     )
 
     if not st.button("🔄 Evaluate All Signals", key="sp_run"):
@@ -143,24 +146,8 @@ def run_signal_performance():
         df_raw  = _load_signals(days_back, src_filter or None, act_filter or None)
         df_full = _load_full()
         if df_raw.empty:
-            st.warning(
-                "⚠️ No signals found in the local database. "
-                "After a fresh deploy, the SQLite DB is empty — upload your exported signal history CSV below."
-            )
-            uploaded = st.file_uploader(
-                "📂 Upload signal_history CSV export",
-                type="csv", key="sp_csv_up",
-                help="Export from the Signal History tab (⬇️ Download full history as CSV), then upload here."
-            )
-            if uploaded is not None:
-                df_raw  = pd.read_csv(uploaded)
-                df_full = df_raw.copy()
-                if src_filter: df_raw = df_raw[df_raw["source"].isin(src_filter)]
-                if act_filter: df_raw = df_raw[df_raw["action"].isin(act_filter)]
-                st.success(f"✅ Loaded {len(df_raw)} signals from uploaded file.")
-            else:
-                st.info("Export from **Signal History → ⬇️ Download full history as CSV**, then upload here.")
-                return
+            st.warning("No signals found in Supabase. Run Live News Feed and Ticker Signals to build history.")
+            return
 
         prog = st.progress(0)
         def _cb(i, total, ticker, date):
@@ -169,7 +156,7 @@ def run_signal_performance():
         ready_df, waiting_df, inconclusive_df = evaluate_signals(
             df                       = df_raw,
             fetch_price_fn           = _fetch_price,
-            fetch_ohlc_fn            = _fetch_ohlc,   # always on — needed for MFE/MAE + optional shock detection
+            fetch_ohlc_fn            = _fetch_ohlc,
             all_signals_for_timeline = df_full,
             progress_callback        = _cb,
         )
@@ -198,8 +185,7 @@ def run_signal_performance():
     if not inconclusive_df.empty:
         with st.expander(f"🌪️ {len(inconclusive_df)} signal(s) excluded — external shock detected", expanded=False):
             st.caption("These signals coincided with an abnormal market move (3× normal daily range). "
-                       "They are NOT counted in the accuracy stats — the original thesis may have been correct "
-                       "but was overridden by an unpredictable external event.")
+                       "They are NOT counted in the accuracy stats.")
             show = [c for c in ["date","ticker","action","confidence","time_horizon",
                                  "entry_price","exit_price","return_pct","spike_reason"] if c in inconclusive_df.columns]
             def ca2(v): return f"color:{GREEN}" if v=="BUY" else f"color:{RED}"
@@ -219,7 +205,6 @@ def run_signal_performance():
         st.warning("No signals ready for evaluation yet — none have reached their trading-day horizon.")
         return
 
-    # ── Reversal note ──────────────────────────────────────────────────────
     sup_count = int(ready_df["superseded"].sum()) if "superseded" in ready_df.columns else 0
     if sup_count > 0:
         st.info(f"ℹ️ {sup_count} signal(s) were closed early by an opposing signal — evaluated at that earlier exit date.")
@@ -234,14 +219,13 @@ def run_signal_performance():
     st.caption(
         "📊 **Price data:** Daily OHLC (Yahoo Finance). "
         "Entry = OPEN of entry day · Exit = CLOSE of exit day · "
-        "MFE/MAE use intraday High/Low — so intraday range is captured, but not tick-by-tick."
+        "MFE/MAE use intraday High/Low."
     )
 
     has_mfe = "mfe" in ready_df.columns and ready_df["mfe"].notna().any()
     mfe_threshold = st.slider(
         "📐 MFE threshold — min % move to count as 'directionally correct'",
         min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="sp_mfe_thresh",
-        help="If price moved this far in the signal's direction at any point, it's 'directionally correct' even if the exit was negative."
     ) if has_mfe else 0.5
 
     if has_mfe:
@@ -293,10 +277,8 @@ def run_signal_performance():
         <div style="background:#0d1b2a;border:1px solid #1e3a5f;border-radius:12px;
                     padding:1.2rem;margin:.5rem 0;font-size:.82rem;color:#8ba3c1;line-height:1.7;">
             <b style="color:#7dd3fc;">Why two numbers?</b><br>
-            <b>Directional</b> = did price move your way at any point during the hold?
-            The thesis was right even if the gain reversed.<br>
-            <b>Exit</b> = was price up at the fixed exit timestamp?
-            This penalises signals that were right but the gain faded before exit.<br><br>
+            <b>Directional</b> = did price move your way at any point during the hold?<br>
+            <b>Exit</b> = was price up at the fixed exit timestamp?<br><br>
             For news signals, directional is more meaningful — news moves fast.
         </div>
         """, unsafe_allow_html=True)
@@ -329,11 +311,6 @@ def run_signal_performance():
     # ── MFE Excursion section ──────────────────────────────────────────────
     if has_mfe:
         st.markdown('<div class="section-header">📐 Excursion Analysis (MFE / MAE)</div>', unsafe_allow_html=True)
-        st.caption(
-            f"MFE = best favourable move during hold (intraday High/Low) · MAE = worst adverse move. "
-            f"Points in the amber zone had MFE ≥ {mfe_threshold:.1f}% but ended negative — "
-            f"right direction, wrong timing."
-        )
         exc_df = ready_df[ready_df["mfe"].notna()].copy()
         if len(exc_df) >= 3:
             fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -346,13 +323,6 @@ def run_signal_performance():
             ax1.axhline(0, color=MUTED, linewidth=0.8, linestyle="--")
             ax1.axvline(mfe_threshold, color=AMBER, linewidth=1, linestyle=":",
                         label=f"MFE ≥ {mfe_threshold:.1f}%")
-            ymin = exc_df["return_pct"].min()
-            if ymin < 0 and exc_df["mfe"].max() > mfe_threshold:
-                ax1.fill_betweenx([ymin * 1.05, 0],
-                                  mfe_threshold, exc_df["mfe"].max() * 1.1,
-                                  alpha=0.05, color=AMBER)
-                ax1.text(mfe_threshold + 0.1, ymin * 0.9,
-                         "Right dir.\nwrong timing", color=AMBER, fontsize=7, alpha=0.85)
             ax1.set_title("MFE vs Final Return %", color=CYAN, fontsize=9)
             ax1.set_xlabel("MFE % (intraday High/Low — best move in signal direction)", color=MUTED, fontsize=8)
             ax1.set_ylabel("Final Return %", color=MUTED, fontsize=8)
@@ -363,22 +333,20 @@ def run_signal_performance():
             ], fontsize=7, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
 
             ax2 = axes[1]
-            grps = ["Correct", "Incorrect"]
             corr_s = exc_df[exc_df["correct"]==1]
             incr_s = exc_df[exc_df["correct"]==0]
             avg_mfe_v = [corr_s["mfe"].mean() if len(corr_s) else 0, incr_s["mfe"].mean() if len(incr_s) else 0]
             avg_mae_v = [corr_s["mae"].mean() if len(corr_s) else 0, incr_s["mae"].mean() if len(incr_s) else 0]
-            x = np.arange(len(grps))
+            x = np.arange(2)
             w = 0.35
             ax2.bar(x - w/2, avg_mfe_v, w, color=GREEN, edgecolor=BORDER, linewidth=0.4, label="Avg MFE", alpha=0.85)
             ax2.bar(x + w/2, avg_mae_v, w, color=RED,   edgecolor=BORDER, linewidth=0.4, label="Avg MAE", alpha=0.85)
-            ax2.set_xticks(x); ax2.set_xticklabels(grps, color=TEXT, fontsize=9)
+            ax2.set_xticks(x); ax2.set_xticklabels(["Correct", "Incorrect"], color=TEXT, fontsize=9)
             ax2.set_title("Avg MFE vs MAE: Correct vs Incorrect Exits", color=CYAN, fontsize=9)
             ax2.set_ylabel("% move", color=MUTED, fontsize=8)
             ax2.legend(fontsize=8, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
             fig.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-            # Insight callout
             if len(incr_s) > 0:
                 timing_victims = int((incr_s["mfe"] >= mfe_threshold).sum())
                 if timing_victims > 0:
@@ -387,7 +355,6 @@ def run_signal_performance():
                         f"were directionally right** — price moved ≥{mfe_threshold:.1f}% favourably but reversed before exit. "
                         f"True directional accuracy: **{dir_acc:.1f}%** vs exit accuracy **{acc:.1f}%**."
                     )
-
 
     # ── Normal vs early-exit comparison ───────────────────────────────────
     if "superseded" in ready_df.columns and sup_count > 0:
@@ -441,7 +408,6 @@ def run_signal_performance():
     # ── By horizon ─────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">⏱ Accuracy by Time Horizon</div>', unsafe_allow_html=True)
     hh = st.columns(4)
-    # Intraday: h_td=0 (new) or h_td=1 (old cached) — check both
     horizon_buckets = [
         ("Intraday",  lambda df: df[df["horizon_td"] <= 1]),
         ("Swing",     lambda df: df[df["horizon_td"] == 5]),

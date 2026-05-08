@@ -2,13 +2,12 @@
 News Signal Accuracy Evaluator
 ================================
 Evaluates ONLY news-based signals using eval_core (horizon-matched + supersession-aware).
+FIXED: reads from Supabase instead of SQLite so data persists across redeploys.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import sqlite3
-from pathlib import Path
 from datetime import datetime, timedelta
 import matplotlib
 matplotlib.use("Agg")
@@ -30,8 +29,6 @@ def _fetch_ohlc(ticker: str, entry_date: str, exit_date: str, lookback_days: int
     except Exception:
         return None
 
-
-DB_PATH = Path(__file__).parent.parent / "signal_history.db"
 
 BLUE   = "#38bdf8"
 CYAN   = "#7dd3fc"
@@ -74,34 +71,38 @@ def _fetch_price(ticker: str, date_str: str) -> float | None:
         return None
 
 
+# ── FIXED: reads from Supabase, not SQLite ───────────────────────────────────
+
 def _load_news_signals() -> pd.DataFrame:
+    """Load news-source signals from Supabase."""
     try:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        df   = pd.read_sql_query("""
-            SELECT * FROM signals
-            WHERE source IN ('live_intelligence','ticker_signals','market_briefing')
-            AND action IN ('BUY','SHORT')
-            ORDER BY timestamp
-        """, conn)
-        conn.close()
-        return df
-    except Exception:
+        from modules.signal_history import get_signals_df
+        df = get_signals_df(
+            days_back=3650,
+            source_filter=["live_intelligence", "ticker_signals", "market_briefing"],
+            action_filter=["BUY", "SHORT"],
+        )
+        if df.empty:
+            return pd.DataFrame()
+        return df.sort_values("timestamp").reset_index(drop=True)
+    except Exception as e:
+        st.error(f"Could not load signals from Supabase: {e}")
         return pd.DataFrame()
 
 
 def _load_all_ticker_signals() -> pd.DataFrame:
     """Load ALL signals (all sources) for the supersession timeline."""
     try:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        df   = pd.read_sql_query(
-            "SELECT * FROM signals WHERE action IN ('BUY','SHORT') ORDER BY timestamp",
-            conn
-        )
-        conn.close()
-        return df
-    except Exception:
+        from modules.signal_history import get_signals_df
+        df = get_signals_df(days_back=3650, action_filter=["BUY", "SHORT"])
+        if df.empty:
+            return pd.DataFrame()
+        return df.sort_values("timestamp").reset_index(drop=True)
+    except Exception as e:
         return pd.DataFrame()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _significance(series: pd.Series) -> dict:
     clean = series.dropna()
@@ -134,33 +135,16 @@ def run_news_signal_evaluator():
     df_raw = _load_news_signals()
 
     if df_raw.empty:
-        st.warning(
-            "⚠️ No news signals found in the local database. "
-            "After a fresh deploy the SQLite DB is empty — you can upload your exported signal history CSV."
-        )
-        uploaded = st.file_uploader(
-            "📂 Upload signal_history CSV export",
-            type="csv", key="nse_csv_up",
-            help="Export from the Signal History tab (⬇️ Download full history as CSV), then upload here."
-        )
-        if uploaded is not None:
-            all_sigs = pd.read_csv(uploaded)
-            # Keep only news-source BUY/SHORT signals
-            df_raw = all_sigs[
-                all_sigs.get("source", pd.Series()).isin(
-                    ["live_intelligence", "ticker_signals", "market_briefing"]
-                ) & all_sigs.get("action", pd.Series()).isin(["BUY", "SHORT"])
-            ] if "source" in all_sigs.columns else all_sigs
-            if df_raw.empty:
-                st.warning("Uploaded CSV has no news-source BUY/SHORT signals.")
-                return
-            st.success(f"✅ Loaded {len(df_raw)} news signals from uploaded file.")
-        else:
-            st.info(
-                "**Option A:** Export from **Signal History → ⬇️ Download full history as CSV**, then upload above.\n\n"
-                "**Option B:** Go to **Live News Feed** → press ▶️ Start → run for 30+ minutes, then come back."
-            )
-            return
+        st.warning("""
+        **No news signals found in Supabase yet.**
+
+        1. Go to **Live News Feed** → press ▶️ Start → leave running 30+ minutes
+        2. Go to **Ticker Signal Lookup** → analyse several tickers
+        3. Come back here after signals have had time to play out
+
+        You need at least 30 evaluated signals for meaningful results.
+        """)
+        return
 
     directional = df_raw.copy()
     c1, c2, c3, c4 = st.columns(4)
@@ -217,7 +201,7 @@ def run_news_signal_evaluator():
         ready_df, waiting_df, inconclusive_df = evaluate_signals(
             df                       = filtered,
             fetch_price_fn           = _fetch_price,
-            fetch_ohlc_fn            = _fetch_ohlc,   # always on — needed for MFE/MAE + optional shock detection
+            fetch_ohlc_fn            = _fetch_ohlc,
             all_signals_for_timeline = df_full,
             progress_callback        = _cb,
         )
@@ -232,7 +216,6 @@ def run_news_signal_evaluator():
     inconclusive_df = st.session_state.get("nse_inconclusive", pd.DataFrame())
     sup_count  = int(ready_df["superseded"].sum()) if not ready_df.empty and "superseded" in ready_df.columns else 0
 
-    # Show inconclusive if any
     if not inconclusive_df.empty:
         with st.expander(f"🌪️ {len(inconclusive_df)} signal(s) excluded — external shock", expanded=False):
             st.caption("Stock moved 3× normal range during eval window. Not counted in accuracy.")
@@ -254,27 +237,23 @@ def run_news_signal_evaluator():
         return
 
     if sup_count > 0:
-        st.info(f"ℹ️ **{sup_count} signal(s) were closed early** because an opposing signal arrived before the original horizon. "
-                f"This is the correct behaviour — a BUY signal after a SHORT means the thesis has changed.")
+        st.info(f"ℹ️ **{sup_count} signal(s) were closed early** because an opposing signal arrived before the original horizon.")
 
     n_eval = len(ready_df)
     if n_eval < 10:
         st.warning(f"Only {n_eval} signals evaluated. Need at least 30 for reliable conclusions.")
 
-    # ── Accuracy banner ────────────────────────────────────────────────────
     total = len(ready_df)
     corr  = int(ready_df["correct"].sum())
     acc   = corr/total*100 if total>0 else 0
     ac_c  = _ac(acc)
     label = "Strong Edge 🟢" if acc>=60 else ("Marginal 🟡" if acc>=50 else "Below Random 🔴")
 
-    # MFE directional accuracy
     has_mfe = "mfe" in ready_df.columns and ready_df["mfe"].notna().any()
     mfe_threshold = st.slider(
         "📐 MFE threshold — min % move to count as 'directionally correct'",
         min_value=0.1, max_value=5.0, value=0.5, step=0.1,
         key="nse_mfe_thresh",
-        help="A signal is 'directionally correct' if price moved at least this % in the signal's direction at any point, even if it reversed by exit."
     ) if has_mfe else 0.5
 
     if has_mfe:
@@ -282,7 +261,6 @@ def run_news_signal_evaluator():
         dir_corr_n           = int(dir_correct_mask.sum())
         dir_corr_acc         = dir_corr_n / total * 100 if total > 0 else 0
         dir_ac_c             = _ac(dir_corr_acc)
-        # Fix: parentheses must wrap the full boolean expression before .sum()
         right_dir_wrong_exit = int((dir_correct_mask & (ready_df["correct"] == 0)).sum())
         dir_label = "Strong 🟢" if dir_corr_acc>=60 else ("Partial 🟡" if dir_corr_acc>=50 else "Weak 🔴")
     else:
@@ -291,14 +269,9 @@ def run_news_signal_evaluator():
     st.caption(
         "📊 **Price data:** Daily OHLC from Yahoo Finance. "
         "Entry = Opening price of entry day · Exit = Closing price of exit day · "
-        "MFE/MAE use intraday High/Low across every day in the hold window — "
-        "so intraday range IS captured for excursion analysis, but not tick-by-tick."
+        "MFE/MAE use intraday High/Low."
     )
 
-    # ── Two-panel banner — directional accuracy is PRIMARY (left/big) ──────
-    # Directional accuracy answers "was the thesis right?" which is the more
-    # meaningful question for news signals.  Exit accuracy ("did the price
-    # happen to be up at the exact exit timestamp?") is secondary.
     ban1, ban2 = st.columns([3, 2])
     with ban1:
         if dir_corr_acc is not None:
@@ -328,7 +301,8 @@ def run_news_signal_evaluator():
             <div style="background:linear-gradient(135deg,#0d1b2a,#0f2035);
                         border:2px solid {ac_c}44;border-radius:16px;
                         padding:1.6rem 2rem;margin:0.5rem 0;text-align:center;">
-                <div style="font-family:'Space Mono',monospace;font-size:3rem;font-weight:700;color:{ac_c};">{acc:.1f}%</div>
+                <div style="font-family:'Space Mono',monospace;font-size:3rem;font-weight:700;
+                            color:{ac_c};">{acc:.1f}%</div>
                 <div style="color:#c9d8e8;font-size:0.95rem;margin-top:0.3rem;">Exit Accuracy — {label}</div>
                 <div style="color:#6b8fad;font-size:0.78rem;margin-top:0.3rem;">
                     {corr}/{total} · {sup_count} closed early · {len(waiting_df)} pending
@@ -354,55 +328,35 @@ def run_news_signal_evaluator():
     # ── MFE Excursion section ──────────────────────────────────────────────
     if has_mfe and total >= 5:
         st.markdown('<div class="section-header">📐 Excursion Analysis — Right Direction, Wrong Timing?</div>', unsafe_allow_html=True)
-        st.caption(
-            "MFE = Maximum Favorable Excursion (how far price moved IN the signal's direction at its peak). "
-            "MAE = Maximum Adverse Excursion (worst move against the signal). "
-            "A high MFE with a negative final return = the thesis was right but news moved fast and the gain reversed."
-        )
-
         exc_df = ready_df[ready_df["mfe"].notna()].copy()
 
-        # ── Excursion scatter: MFE vs final return ─────────────────────────
         if len(exc_df) >= 3:
             fig, axes = plt.subplots(1, 2, figsize=(12, 4))
             _style_fig(fig, list(axes))
 
             ax1 = axes[0]
-            # Color: green = correct exit, red = incorrect exit
             colors = [GREEN if c else RED for c in exc_df["correct"]]
             ax1.scatter(exc_df["mfe"], exc_df["return_pct"],
                         c=colors, alpha=0.75, edgecolors=BORDER, linewidth=0.5, s=60)
             ax1.axhline(0, color=MUTED, linewidth=0.8, linestyle="--")
             ax1.axvline(mfe_threshold, color=AMBER, linewidth=1, linestyle=":",
                         label=f"MFE threshold {mfe_threshold:.1f}%")
-
-            # Annotate the "right direction, wrong exit" quadrant
-            ax1.fill_betweenx(
-                y=[-100, 0], x1=mfe_threshold, x2=exc_df["mfe"].max() * 1.1,
-                alpha=0.05, color=AMBER
-            )
-            ax1.text(
-                mfe_threshold + 0.1, exc_df["return_pct"].min() * 0.85,
-                "Right direction\nwrong timing", color=AMBER, fontsize=7, alpha=0.8
-            )
             ax1.set_title("MFE vs Final Return", color=CYAN, fontsize=9)
             ax1.set_xlabel("MFE % (best favourable move during hold)", color=MUTED, fontsize=8)
             ax1.set_ylabel("Final Return %", color=MUTED, fontsize=8)
-            ax1.legend(fontsize=7, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
-            # Legend dots
             from matplotlib.lines import Line2D
-            legend_elements = [
+            ax1.legend(handles=[
                 Line2D([0],[0], marker='o', color='w', markerfacecolor=GREEN, markersize=7, label='Correct exit'),
                 Line2D([0],[0], marker='o', color='w', markerfacecolor=RED,   markersize=7, label='Incorrect exit'),
-            ]
-            ax1.legend(handles=legend_elements, fontsize=7, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
+            ], fontsize=7, facecolor=CARD, edgecolor=BORDER, labelcolor=TEXT)
 
-            # MFE vs MAE bar comparison
             ax2 = axes[1]
-            avg_mfe_corr = exc_df[exc_df["correct"]==1]["mfe"].mean()
-            avg_mfe_incr = exc_df[exc_df["correct"]==0]["mfe"].mean()
-            avg_mae_corr = exc_df[exc_df["correct"]==1]["mae"].mean()
-            avg_mae_incr = exc_df[exc_df["correct"]==0]["mae"].mean()
+            ex_corr = exc_df[exc_df["correct"]==1]
+            ex_incr = exc_df[exc_df["correct"]==0]
+            avg_mfe_corr = ex_corr["mfe"].mean() if len(ex_corr) else 0
+            avg_mfe_incr = ex_incr["mfe"].mean() if len(ex_incr) else 0
+            avg_mae_corr = ex_corr["mae"].mean() if len(ex_corr) else 0
+            avg_mae_incr = ex_incr["mae"].mean() if len(ex_incr) else 0
 
             cats = ["Correct signals\nMFE", "Correct signals\nMAE",
                     "Incorrect signals\nMFE", "Incorrect signals\nMAE"]
@@ -412,56 +366,11 @@ def run_news_signal_evaluator():
             ax2.bar(cats, vals, color=bcolors2, edgecolor=BORDER, linewidth=0.4, alpha=0.85)
             ax2.set_title("Avg MFE vs MAE: Correct vs Incorrect", color=CYAN, fontsize=9)
             ax2.set_ylabel("% move", color=MUTED, fontsize=8)
-            for i, v in enumerate(vals):
-                if v > 0:
-                    ax2.text(i, v + 0.05, f"{v:.2f}%", ha="center", color=TEXT, fontsize=8)
-
             fig.tight_layout()
             st.pyplot(fig)
             plt.close(fig)
 
-        # ── Excursion summary table ────────────────────────────────────────
-        ex_corr = exc_df[exc_df["correct"]==1]
         ex_incr = exc_df[exc_df["correct"]==0]
-        ex_dir  = exc_df[exc_df["mfe"] >= mfe_threshold]
-
-        exc_sum = pd.DataFrame([
-            {
-                "Group":              "All signals",
-                "Count":              len(exc_df),
-                "Avg MFE %":          round(exc_df["mfe"].mean(), 2),
-                "Avg MAE %":          round(exc_df["mae"].mean(), 2),
-                "Avg Exc. Ratio":     round(exc_df["excursion_ratio"].dropna().mean(), 3) if "excursion_ratio" in exc_df else np.nan,
-                "Dir. Correct":       f"{(exc_df['mfe'] >= mfe_threshold).sum()} ({(exc_df['mfe'] >= mfe_threshold).mean()*100:.0f}%)",
-            },
-            {
-                "Group":              "✅ Correct exit",
-                "Count":              len(ex_corr),
-                "Avg MFE %":          round(ex_corr["mfe"].mean(), 2) if len(ex_corr) else np.nan,
-                "Avg MAE %":          round(ex_corr["mae"].mean(), 2) if len(ex_corr) else np.nan,
-                "Avg Exc. Ratio":     round(ex_corr["excursion_ratio"].dropna().mean(), 3) if len(ex_corr) and "excursion_ratio" in ex_corr else np.nan,
-                "Dir. Correct":       f"{(ex_corr['mfe'] >= mfe_threshold).sum()}" if len(ex_corr) else "—",
-            },
-            {
-                "Group":              "❌ Incorrect exit",
-                "Count":              len(ex_incr),
-                "Avg MFE %":          round(ex_incr["mfe"].mean(), 2) if len(ex_incr) else np.nan,
-                "Avg MAE %":          round(ex_incr["mae"].mean(), 2) if len(ex_incr) else np.nan,
-                "Avg Exc. Ratio":     round(ex_incr["excursion_ratio"].dropna().mean(), 3) if len(ex_incr) and "excursion_ratio" in ex_incr else np.nan,
-                "Dir. Correct":       f"{(ex_incr['mfe'] >= mfe_threshold).sum()} ← right direction, timed out" if len(ex_incr) else "—",
-            },
-        ])
-        def _cmfe(v):
-            try:
-                n = float(str(v).split()[0])
-                return f"color:{GREEN}" if n >= 1 else f"color:{MUTED}"
-            except Exception:
-                return ""
-        st.dataframe(
-            exc_sum.style.format({"Avg MFE %": "{:.2f}%", "Avg MAE %": "{:.2f}%", "Avg Exc. Ratio": "{:.3f}"}, na_rep="—"),
-            use_container_width=True, hide_index=True
-        )
-
         if len(ex_incr) > 0:
             rt_wrong = int((ex_incr["mfe"] >= mfe_threshold).sum())
             if rt_wrong > 0:
@@ -469,15 +378,11 @@ def run_news_signal_evaluator():
                 st.warning(
                     f"⚡ **{rt_wrong} of your {len(ex_incr)} 'incorrect' signals ({pct_rt:.0f}%) were actually right in direction** — "
                     f"price moved ≥{mfe_threshold:.1f}% favourably before reversing. "
-                    f"These are timing/exit issues, not thesis failures. "
                     f"Consider tighter take-profit targets or shorter hold horizons for news-driven signals."
                 )
 
-
-
     # ── Confidence table ───────────────────────────────────────────────────
     st.markdown('<div class="section-header">🎯 Accuracy by Confidence Level</div>', unsafe_allow_html=True)
-    st.caption("HIGH confidence signals should beat MEDIUM and LOW. If not, the confidence calibration needs improvement.")
 
     conf_rows = []
     for conf in ["HIGH","MEDIUM","LOW"]:
@@ -538,7 +443,6 @@ def run_news_signal_evaluator():
         fig, ax = plt.subplots(figsize=(5,3.5))
         _style_fig(fig, ax)
         confs   = ["HIGH","MEDIUM","LOW"]
-        palette = {"HIGH":BLUE,"MEDIUM":AMBER,"LOW":MUTED}
         accs2   = [ready_df[ready_df["confidence"]==c]["correct"].mean()*100
                    if len(ready_df[ready_df["confidence"]==c])>=3 else 0 for c in confs]
         ns2     = [len(ready_df[ready_df["confidence"]==c]) for c in confs]
@@ -621,11 +525,10 @@ def run_news_signal_evaluator():
     sty_d = sty_d.format(fmt)
     st.dataframe(sty_d, use_container_width=True, hide_index=True)
 
-    # ── Honest interpretation ──────────────────────────────────────────────
+    # ── Interpretation ─────────────────────────────────────────────────────
     st.markdown('<div class="section-header">💡 Interpretation</div>', unsafe_allow_html=True)
     if total < 20:
-        st.error(f"**{total} evaluated signals is not enough.** Need 30–50 minimum. "
-                 f"Run Live News Feed daily and analyse tickers regularly.")
+        st.error(f"**{total} evaluated signals is not enough.** Need 30–50 minimum.")
     else:
         sig_all = _significance(ready_df["return_pct"])
         hc_sub  = ready_df[ready_df["confidence"]=="HIGH"]
@@ -633,11 +536,9 @@ def run_news_signal_evaluator():
         if acc>=60 and sig_all["sig"]:
             st.success(f"🟢 **{acc:.1f}% accuracy (p={sig_all['p']:.4f}) on {total} signals** — statistically significant edge.")
         elif acc>=55:
-            st.info(f"🟡 **{acc:.1f}% accuracy** — modest edge. "
-                    f"{'Statistically significant.' if sig_all['sig'] else f'Not yet significant (p={sig_all[chr(112)]:.4f}). Need more signals.'}")
+            st.info(f"🟡 **{acc:.1f}% accuracy** — modest edge.")
         else:
-            st.warning(f"🔴 **{acc:.1f}% accuracy** — no meaningful edge yet. "
-                       f"Try filtering to HIGH confidence only.")
+            st.warning(f"🔴 **{acc:.1f}% accuracy** — no meaningful edge yet. Try filtering to HIGH confidence only.")
         if hc_acc is not None:
             diff = hc_acc - acc
             if diff > 5:
